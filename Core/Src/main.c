@@ -23,9 +23,12 @@
 #include "dma.h"
 #include "usart.h"
 #include "gpio.h"
+#include "fsmc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "lcd.h"
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
@@ -36,6 +39,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define VOFA_SEND_PERIOD_MS 2U
+#define LCD_REFRESH_PERIOD_MS 100U
+#define LCD_WAVE_POINTS 304U
+#define LCD_WAVE_LEFT 8U
+#define LCD_WAVE_WIDTH LCD_WAVE_POINTS
+#define LCD_ADC1_TOP 56U
+#define LCD_ADC2_TOP 152U
+#define LCD_WAVE_HEIGHT 64U
+#define ADC_MAX_CODE 4095U
 
 /* USER CODE END PD */
 
@@ -47,12 +59,30 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint16_t adc1_value = 0U;
+static uint16_t adc2_value = 0U;
+static uint16_t lcd_adc1_wave[LCD_WAVE_POINTS];
+static uint16_t lcd_adc2_wave[LCD_WAVE_POINTS];
+static uint16_t lcd_wave_index = 0U;
+static uint16_t lcd_wave_count = 0U;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+static void AdcDacVofa_Start(void);
+static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value);
+static void UpdateDacOutputs(uint16_t value1, uint16_t value2);
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2);
+static void LcdDisplay_Init(void);
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2);
+static void LcdPushSamples(uint16_t value1, uint16_t value2);
+static void LcdDrawStatic(void);
+static void LcdDrawValues(uint16_t value1, uint16_t value2);
+static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color);
+static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t color);
+static uint16_t LcdAdcToY(uint16_t value, uint16_t top);
 
 /* USER CODE END PFP */
 
@@ -95,7 +125,10 @@ int main(void)
   MX_ADC2_Init();
   MX_USART1_UART_Init();
   MX_DAC_Init();
+  MX_FSMC_Init();
   /* USER CODE BEGIN 2 */
+  LcdDisplay_Init();
+  AdcDacVofa_Start();
 
   /* USER CODE END 2 */
 
@@ -106,6 +139,20 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t last_vofa_tick = 0U;
+    uint32_t now = HAL_GetTick();
+
+    adc1_value = ReadAdcValue(&hadc1, adc1_value);
+    adc2_value = ReadAdcValue(&hadc2, adc2_value);
+    UpdateDacOutputs(adc1_value, adc2_value);
+    LcdDisplay_Update(now, adc1_value, adc2_value);
+
+    if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
+    {
+      last_vofa_tick = now;
+      LcdPushSamples(adc1_value, adc2_value);
+      Vofa_SendSamples(adc1_value, adc2_value);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -157,6 +204,190 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void AdcDacVofa_Start(void)
+{
+  if (HAL_DAC_Start(&hdac, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_DAC_Start(&hdac, DAC_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value)
+{
+  (void)HAL_ADC_Stop(hadc);
+  __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_OVR);
+
+  if (HAL_ADC_Start(hadc) != HAL_OK)
+  {
+    return previous_value;
+  }
+
+  if (HAL_ADC_PollForConversion(hadc, 10U) != HAL_OK)
+  {
+    (void)HAL_ADC_Stop(hadc);
+    return previous_value;
+  }
+
+  uint16_t value = (uint16_t)HAL_ADC_GetValue(hadc);
+  (void)HAL_ADC_Stop(hadc);
+
+  return value;
+}
+
+static void UpdateDacOutputs(uint16_t value1, uint16_t value2)
+{
+  if (HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, value1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_DAC_SetValue(&hdac, DAC_CHANNEL_2, DAC_ALIGN_12B_R, value2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2)
+{
+  char tx_buf[24];
+  int len = snprintf(tx_buf, sizeof(tx_buf), "%u,%u\r\n", value1, value2);
+
+  if (len > 0)
+  {
+    (void)HAL_UART_Transmit(&huart1, (uint8_t *)tx_buf, (uint16_t)len, 10U);
+  }
+}
+
+static void LcdDisplay_Init(void)
+{
+  LCD_Init();
+  LcdDrawStatic();
+  LcdDrawValues(0U, 0U);
+}
+
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2)
+{
+  static uint32_t last_lcd_tick = 0U;
+
+  if ((now - last_lcd_tick) < LCD_REFRESH_PERIOD_MS)
+  {
+    return;
+  }
+
+  last_lcd_tick = now;
+  LcdDrawValues(value1, value2);
+  LcdDrawWaveform(LCD_ADC1_TOP, lcd_adc1_wave, BLUE);
+  LcdDrawWaveform(LCD_ADC2_TOP, lcd_adc2_wave, RED);
+}
+
+static void LcdPushSamples(uint16_t value1, uint16_t value2)
+{
+  lcd_adc1_wave[lcd_wave_index] = value1;
+  lcd_adc2_wave[lcd_wave_index] = value2;
+
+  lcd_wave_index++;
+  if (lcd_wave_index >= LCD_WAVE_POINTS)
+  {
+    lcd_wave_index = 0U;
+  }
+
+  if (lcd_wave_count < LCD_WAVE_POINTS)
+  {
+    lcd_wave_count++;
+  }
+}
+
+static void LcdDrawStatic(void)
+{
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+  LCD_Clear(WHITE);
+  LCD_ShowString(8, 6, 220, 16, 16, (uint8_t *)"ADC DAC VOFA LCD");
+  LCD_ShowString(8, 28, 36, 12, 12, (uint8_t *)"ADC1");
+  LCD_ShowString(104, 28, 36, 12, 12, (uint8_t *)"ADC2");
+  LCD_ShowString(200, 28, 36, 12, 12, (uint8_t *)"DAC");
+  LcdDrawWaveFrame(LCD_ADC1_TOP, "ADC1 PA2 -> DAC1 PA4", BLUE);
+  LcdDrawWaveFrame(LCD_ADC2_TOP, "ADC2 PA3 -> DAC2 PA5", RED);
+}
+
+static void LcdDrawValues(uint16_t value1, uint16_t value2)
+{
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+
+  LCD_Fill(40, 28, 72, 39, WHITE);
+  LCD_ShowNum(40, 28, value1, 4, 12);
+  LCD_Fill(136, 28, 168, 39, WHITE);
+  LCD_ShowNum(136, 28, value2, 4, 12);
+  LCD_Fill(232, 28, 284, 39, WHITE);
+  LCD_ShowString(232, 28, 52, 12, 12, (uint8_t *)"FOLLOW");
+}
+
+static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color)
+{
+  uint16_t bottom = top + LCD_WAVE_HEIGHT - 1U;
+  uint16_t right = LCD_WAVE_LEFT + LCD_WAVE_WIDTH - 1U;
+  uint16_t mid = top + LCD_WAVE_HEIGHT / 2U;
+
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+  LCD_ShowString(LCD_WAVE_LEFT, top - 14U, 180, 12, 12, (uint8_t *)label);
+
+  POINT_COLOR = GRAY;
+  LCD_DrawRectangle(LCD_WAVE_LEFT, top, right, bottom);
+  LCD_DrawLine(LCD_WAVE_LEFT, mid, right, mid);
+
+  POINT_COLOR = color;
+}
+
+static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t color)
+{
+  uint16_t bottom = top + LCD_WAVE_HEIGHT - 1U;
+  uint16_t right = LCD_WAVE_LEFT + LCD_WAVE_WIDTH - 1U;
+  uint16_t start = 0U;
+  uint16_t last_x = LCD_WAVE_LEFT;
+  uint16_t last_y;
+
+  LCD_Fill(LCD_WAVE_LEFT + 1U, top + 1U, right - 1U, bottom - 1U, WHITE);
+  LcdDrawWaveFrame(top, top == LCD_ADC1_TOP ? "ADC1 PA2 -> DAC1 PA4" : "ADC2 PA3 -> DAC2 PA5", color);
+
+  if (lcd_wave_count < 2U)
+  {
+    return;
+  }
+
+  if (lcd_wave_count >= LCD_WAVE_POINTS)
+  {
+    start = lcd_wave_index;
+  }
+
+  last_y = LcdAdcToY(samples[start], top);
+  POINT_COLOR = color;
+
+  for (uint16_t i = 1U; i < lcd_wave_count; ++i)
+  {
+    uint16_t sample_index = (uint16_t)((start + i) % LCD_WAVE_POINTS);
+    uint16_t x = (uint16_t)(LCD_WAVE_LEFT + i);
+    uint16_t y = LcdAdcToY(samples[sample_index], top);
+
+    LCD_DrawLine(last_x, last_y, x, y);
+    last_x = x;
+    last_y = y;
+  }
+}
+
+static uint16_t LcdAdcToY(uint16_t value, uint16_t top)
+{
+  uint32_t y_span = LCD_WAVE_HEIGHT - 3U;
+  uint32_t y = top + 1U + y_span - ((uint32_t)value * y_span) / ADC_MAX_CODE;
+
+  return (uint16_t)y;
+}
 
 /* USER CODE END 4 */
 
