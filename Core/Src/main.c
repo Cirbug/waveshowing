@@ -18,9 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "adc.h"
 #include "dac.h"
 #include "dma.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 #include "fsmc.h"
@@ -34,6 +36,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+  uint8_t armed;
+  uint32_t last_cross_tick;
+  uint32_t frequency_hz;
+} AdcFreqMeter;
 
 /* USER CODE END PTD */
 
@@ -44,10 +52,14 @@
 #define LCD_WAVE_POINTS 304U
 #define LCD_WAVE_LEFT 8U
 #define LCD_WAVE_WIDTH LCD_WAVE_POINTS
-#define LCD_ADC1_TOP 56U
-#define LCD_ADC2_TOP 152U
-#define LCD_WAVE_HEIGHT 64U
+#define LCD_ADC1_TOP 80U
+#define LCD_ADC2_TOP 168U
+#define LCD_WAVE_HEIGHT 56U
 #define ADC_MAX_CODE 4095U
+#define TIM5_COUNTER_HZ 1000000U
+#define FREQ_TIMEOUT_MS 1000U
+#define ADC_FREQ_LOW_THRESHOLD 1900U
+#define ADC_FREQ_HIGH_THRESHOLD 2200U
 
 /* USER CODE END PD */
 
@@ -65,24 +77,35 @@ static uint16_t lcd_adc1_wave[LCD_WAVE_POINTS];
 static uint16_t lcd_adc2_wave[LCD_WAVE_POINTS];
 static uint16_t lcd_wave_index = 0U;
 static uint16_t lcd_wave_count = 0U;
+static volatile uint32_t frequency_hz = 0U;
+static volatile uint32_t frequency_last_capture_tick = 0U;
+static uint32_t tim5_last_capture = 0U;
+static uint8_t tim5_capture_ready = 0U;
+static AdcFreqMeter adc1_freq_meter = {1U, 0U, 0U};
+static AdcFreqMeter adc2_freq_meter = {1U, 0U, 0U};
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 static void AdcDacVofa_Start(void);
 static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value);
+static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t now);
 static void UpdateDacOutputs(uint16_t value1, uint16_t value2);
-static void Vofa_SendSamples(uint16_t value1, uint16_t value2);
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
 static void LcdDisplay_Init(void);
-static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2);
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
 static void LcdPushSamples(uint16_t value1, uint16_t value2);
 static void LcdDrawStatic(void);
-static void LcdDrawValues(uint16_t value1, uint16_t value2);
+static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
+static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq);
 static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color);
 static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t color);
 static uint16_t LcdAdcToY(uint16_t value, uint16_t top);
+void App_Init(void);
+void App_TaskStep(void);
 
 /* USER CODE END PFP */
 
@@ -126,11 +149,19 @@ int main(void)
   MX_USART1_UART_Init();
   MX_DAC_Init();
   MX_FSMC_Init();
+  MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
-  LcdDisplay_Init();
-  AdcDacVofa_Start();
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -139,20 +170,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    static uint32_t last_vofa_tick = 0U;
-    uint32_t now = HAL_GetTick();
-
-    adc1_value = ReadAdcValue(&hadc1, adc1_value);
-    adc2_value = ReadAdcValue(&hadc2, adc2_value);
-    UpdateDacOutputs(adc1_value, adc2_value);
-    LcdDisplay_Update(now, adc1_value, adc2_value);
-
-    if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
-    {
-      last_vofa_tick = now;
-      LcdPushSamples(adc1_value, adc2_value);
-      Vofa_SendSamples(adc1_value, adc2_value);
-    }
   }
   /* USER CODE END 3 */
 }
@@ -204,6 +221,45 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void App_Init(void)
+{
+  LcdDisplay_Init();
+  AdcDacVofa_Start();
+
+  if (HAL_TIM_IC_Start_IT(&htim5, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+void App_TaskStep(void)
+{
+  static uint32_t last_vofa_tick = 0U;
+  uint32_t now = HAL_GetTick();
+  uint32_t pa0_freq = frequency_hz;
+
+  if ((now - frequency_last_capture_tick) > FREQ_TIMEOUT_MS)
+  {
+    pa0_freq = 0U;
+    frequency_hz = 0U;
+  }
+
+  adc1_value = ReadAdcValue(&hadc1, adc1_value);
+  adc2_value = ReadAdcValue(&hadc2, adc2_value);
+  uint32_t adc1_freq = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
+  uint32_t adc2_freq = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
+
+  UpdateDacOutputs(adc1_value, adc2_value);
+  LcdDisplay_Update(now, adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
+
+  if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
+  {
+    last_vofa_tick = now;
+    LcdPushSamples(adc1_value, adc2_value);
+    Vofa_SendSamples(adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
+  }
+}
+
 static void AdcDacVofa_Start(void)
 {
   if (HAL_DAC_Start(&hdac, DAC_CHANNEL_1) != HAL_OK)
@@ -239,6 +295,37 @@ static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value)
   return value;
 }
 
+static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t now)
+{
+  if (sample <= ADC_FREQ_LOW_THRESHOLD)
+  {
+    meter->armed = 1U;
+  }
+
+  if ((meter->armed != 0U) && (sample >= ADC_FREQ_HIGH_THRESHOLD))
+  {
+    if (meter->last_cross_tick != 0U)
+    {
+      uint32_t period_ms = now - meter->last_cross_tick;
+
+      if (period_ms != 0U)
+      {
+        meter->frequency_hz = (1000U + (period_ms / 2U)) / period_ms;
+      }
+    }
+
+    meter->last_cross_tick = now;
+    meter->armed = 0U;
+  }
+
+  if ((meter->last_cross_tick == 0U) || ((now - meter->last_cross_tick) > FREQ_TIMEOUT_MS))
+  {
+    meter->frequency_hz = 0U;
+  }
+
+  return meter->frequency_hz;
+}
+
 static void UpdateDacOutputs(uint16_t value1, uint16_t value2)
 {
   if (HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, value1) != HAL_OK)
@@ -252,10 +339,15 @@ static void UpdateDacOutputs(uint16_t value1, uint16_t value2)
   }
 }
 
-static void Vofa_SendSamples(uint16_t value1, uint16_t value2)
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
-  char tx_buf[24];
-  int len = snprintf(tx_buf, sizeof(tx_buf), "%u,%u\r\n", value1, value2);
+  char tx_buf[64];
+  int len = snprintf(tx_buf, sizeof(tx_buf), "%u,%u,%lu,%lu,%lu\r\n",
+                     value1,
+                     value2,
+                     (unsigned long)pa0_freq,
+                     (unsigned long)adc1_freq,
+                     (unsigned long)adc2_freq);
 
   if (len > 0)
   {
@@ -267,10 +359,10 @@ static void LcdDisplay_Init(void)
 {
   LCD_Init();
   LcdDrawStatic();
-  LcdDrawValues(0U, 0U);
+  LcdDrawValues(0U, 0U, 0U, 0U, 0U);
 }
 
-static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2)
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
   static uint32_t last_lcd_tick = 0U;
 
@@ -280,7 +372,7 @@ static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2)
   }
 
   last_lcd_tick = now;
-  LcdDrawValues(value1, value2);
+  LcdDrawValues(value1, value2, pa0_freq, adc1_freq, adc2_freq);
   LcdDrawWaveform(LCD_ADC1_TOP, lcd_adc1_wave, BLUE);
   LcdDrawWaveform(LCD_ADC2_TOP, lcd_adc2_wave, RED);
 }
@@ -307,25 +399,44 @@ static void LcdDrawStatic(void)
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
   LCD_Clear(WHITE);
-  LCD_ShowString(8, 6, 220, 16, 16, (uint8_t *)"ADC DAC VOFA LCD");
-  LCD_ShowString(8, 28, 36, 12, 12, (uint8_t *)"ADC1");
-  LCD_ShowString(104, 28, 36, 12, 12, (uint8_t *)"ADC2");
-  LCD_ShowString(200, 28, 36, 12, 12, (uint8_t *)"DAC");
+  LCD_ShowString(8, 4, 220, 16, 16, (uint8_t *)"ADC DAC VOFA LCD");
   LcdDrawWaveFrame(LCD_ADC1_TOP, "ADC1 PA2 -> DAC1 PA4", BLUE);
   LcdDrawWaveFrame(LCD_ADC2_TOP, "ADC2 PA3 -> DAC2 PA5", RED);
 }
 
-static void LcdDrawValues(uint16_t value1, uint16_t value2)
+static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
-  LCD_Fill(40, 28, 72, 39, WHITE);
-  LCD_ShowNum(40, 28, value1, 4, 12);
-  LCD_Fill(136, 28, 168, 39, WHITE);
-  LCD_ShowNum(136, 28, value2, 4, 12);
-  LCD_Fill(232, 28, 284, 39, WHITE);
-  LCD_ShowString(232, 28, 52, 12, 12, (uint8_t *)"FOLLOW");
+  LCD_Fill(0, 22, 319, 63, WHITE);
+
+  LCD_ShowString(8, 22, 18, 12, 12, (uint8_t *)"A1");
+  LCD_ShowNum(30, 22, value1, 4, 12);
+  LCD_ShowString(76, 22, 18, 12, 12, (uint8_t *)"F1");
+  LcdDrawFrequency(96, 22, adc1_freq);
+
+  LCD_ShowString(8, 36, 18, 12, 12, (uint8_t *)"A2");
+  LCD_ShowNum(30, 36, value2, 4, 12);
+  LCD_ShowString(76, 36, 18, 12, 12, (uint8_t *)"F2");
+  LcdDrawFrequency(96, 36, adc2_freq);
+
+  LCD_ShowString(8, 50, 18, 12, 12, (uint8_t *)"P0");
+  LcdDrawFrequency(30, 50, pa0_freq);
+}
+
+static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq)
+{
+  if (freq < 100000U)
+  {
+    LCD_ShowNum(x, y, freq, 5, 12);
+    LCD_ShowString(x + 34U, y, 18, 12, 12, (uint8_t *)"Hz");
+  }
+  else
+  {
+    LCD_ShowNum(x, y, freq / 1000U, 5, 12);
+    LCD_ShowString(x + 34U, y, 24, 12, 12, (uint8_t *)"kHz");
+  }
 }
 
 static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color)
@@ -387,6 +498,32 @@ static uint16_t LcdAdcToY(uint16_t value, uint16_t top)
   uint32_t y = top + 1U + y_span - ((uint32_t)value * y_span) / ADC_MAX_CODE;
 
   return (uint16_t)y;
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+  if ((htim->Instance == TIM5) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1))
+  {
+    uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+    if (tim5_capture_ready != 0U)
+    {
+      uint32_t delta = capture - tim5_last_capture;
+
+      if (delta != 0U)
+      {
+        frequency_hz = TIM5_COUNTER_HZ / delta;
+        frequency_last_capture_tick = HAL_GetTick();
+      }
+    }
+    else
+    {
+      tim5_capture_ready = 1U;
+      frequency_last_capture_tick = HAL_GetTick();
+    }
+
+    tim5_last_capture = capture;
+  }
 }
 
 /* USER CODE END 4 */
