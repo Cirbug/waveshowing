@@ -138,12 +138,14 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
+  /* 主任务负责本项目的核心流程：初始化外设、采 ADC、更新 DAC、刷新 LCD、发送 VOFA */
   App_Init();
 
   /* Infinite loop */
   for(;;)
   {
     App_TaskStep();
+    /* 1ms 调一次 App_TaskStep，ADC 软件测频的时间分辨率也主要受这个延时影响 */
     osDelay(1);
   }
   /* USER CODE END StartDefaultTask */
@@ -159,6 +161,7 @@ void StartDefaultTask(void *argument)
 void StartTask02(void *argument)
 {
   /* USER CODE BEGIN StartTask02 */
+  /* 预留任务：后续如果想把 VOFA 串口发送单独拆出来，可以放到这里 */
   /* Infinite loop */
   for(;;)
   {
@@ -177,6 +180,7 @@ void StartTask02(void *argument)
 void StartTask03(void *argument)
 {
   /* USER CODE BEGIN StartTask03 */
+  /* 预留任务：后续如果想把 LCD 刷新单独拆出来，可以放到这里 */
   /* Infinite loop */
   for(;;)
   {

@@ -51,22 +51,8 @@
 osThreadId_t ADCDACTaskHandle;
 const osThreadAttr_t ADCDACTask_attributes = {
   .name = "ADCDACTask",
-  .stack_size = 1024 * 4, /* 这个任务里有 LCD 刷新和 snprintf，栈给大一点更稳 */
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
-};
-/* Definitions for VofaTask */
-osThreadId_t VofaTaskHandle;
-const osThreadAttr_t VofaTask_attributes = {
-  .name = "VofaTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
-/* Definitions for LcdTask */
-osThreadId_t LcdTaskHandle;
-const osThreadAttr_t LcdTask_attributes = {
-  .name = "LcdTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,8 +63,6 @@ extern void App_TaskStep(void);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
-void StartTask02(void *argument);
-void StartTask03(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -112,12 +96,6 @@ void MX_FREERTOS_Init(void) {
   /* creation of ADCDACTask */
   ADCDACTaskHandle = osThreadNew(StartDefaultTask, NULL, &ADCDACTask_attributes);
 
-  /* creation of VofaTask */
-  VofaTaskHandle = osThreadNew(StartTask02, NULL, &VofaTask_attributes);
-
-  /* creation of LcdTask */
-  LcdTaskHandle = osThreadNew(StartTask03, NULL, &LcdTask_attributes);
-
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -149,44 +127,6 @@ void StartDefaultTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END StartDefaultTask */
-}
-
-/* USER CODE BEGIN Header_StartTask02 */
-/**
-* @brief Function implementing the VofaTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartTask02 */
-void StartTask02(void *argument)
-{
-  /* USER CODE BEGIN StartTask02 */
-  /* 预留任务：后续如果想把 VOFA 串口发送单独拆出来，可以放到这里 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartTask02 */
-}
-
-/* USER CODE BEGIN Header_StartTask03 */
-/**
-* @brief Function implementing the LcdTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartTask03 */
-void StartTask03(void *argument)
-{
-  /* USER CODE BEGIN StartTask03 */
-  /* 预留任务：后续如果想把 LCD 刷新单独拆出来，可以放到这里 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartTask03 */
 }
 
 /* Private application code --------------------------------------------------*/
