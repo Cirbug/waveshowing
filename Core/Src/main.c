@@ -22,6 +22,7 @@
 #include "adc.h"
 #include "dac.h"
 #include "dma.h"
+#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -32,6 +33,7 @@
 #include "lcd.h"
 #include "touch.h"
 #include "scalar_kalman.h"
+#include "spi_flash.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -49,19 +51,71 @@ typedef enum
 {
   UI_PAGE_HOME = 0,
   UI_PAGE_SINGLE,
-  UI_PAGE_DOUBLE
+  UI_PAGE_DOUBLE,
+  UI_PAGE_CALIBRATION
 } UiPage;
+
+typedef struct
+{
+  uint8_t valid;
+  uint8_t frequency_valid;
+  uint32_t frequency_hz;
+  int32_t difference;
+} UiMeasurementResult;
+
+#define CALIBRATION_MAX_POINTS 5U
+
+typedef struct
+{
+  uint32_t point_count;
+  float length_m[CALIBRATION_MAX_POINTS];
+  float resistance_ohm[CALIBRATION_MAX_POINTS];
+  float resistance_per_meter;
+  float zero_resistance;
+} DoubleCalibrationData;
+
+typedef struct
+{
+  uint32_t point_count;
+  float length_m[CALIBRATION_MAX_POINTS];
+  uint32_t frequency_hz[CALIBRATION_MAX_POINTS];
+  float inverse_period_slope;
+  float offset_m;
+} SingleCalibrationData;
+
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  SingleCalibrationData single;
+  DoubleCalibrationData double_end;
+  uint32_t checksum;
+} CalibrationStorage;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define VOFA_SEND_PERIOD_MS 2U          /* VOFA 串口发送周期，2ms 约等于 500Hz 刷新 */
-#define LCD_REFRESH_PERIOD_MS 100U      /* LCD 刷新比较慢，100ms 刷一次可减少闪烁和占用 */
 #define UI_NAV_TOP 200U                 /* 底部导航栏顶部，屏幕为 320x240 */
 #define UI_NAV_BOTTOM 239U
-#define UI_NAV_HOME_RIGHT 106U
-#define UI_NAV_SINGLE_RIGHT 213U
+#define UI_NAV_HOME_RIGHT 79U
+#define UI_NAV_SINGLE_RIGHT 159U
+#define UI_NAV_DOUBLE_RIGHT 239U
+#define UI_RUN_LEFT 244U
+#define UI_RUN_TOP 8U
+#define UI_RUN_RIGHT 311U
+#define UI_RUN_BOTTOM 42U
+#define RUN_DURATION_MS 4000U           /* 每次按 RUN 后采集 4 秒 */
+#define RUN_SAMPLE_PERIOD_MS 20U        /* 每 20ms 保存一个样本 */
+#define RUN_MAX_SAMPLES 200U            /* 4 秒最多保存 200 组样本 */
+#define CALIBRATION_MAGIC 0x43414C32UL   /* Flash 校准数据标志：CAL2 */
+#define CALIBRATION_VERSION 2UL
+#define CALIBRATION_FLASH_ADDRESS 0x00FFF000UL /* NM25Q128 最后一个 4KB 扇区 */
+#define CAL_KEYPAD_LEFT 140U
+#define CAL_KEYPAD_TOP 48U
+#define CAL_KEY_WIDTH 60U
+#define CAL_KEY_HEIGHT 37U
 #define TIM5_COUNTER_HZ 1000000U        /* TIM5 计数频率：84MHz / 84 = 1MHz，1 个计数 = 1us */
 #define FREQ_TIMEOUT_MS 1000U           /* 超过 1 秒没有新边沿/过阈值，就认为频率为 0 */
 #define ADC_FREQ_LOW_THRESHOLD 1900U    /* ADC 软件测频低阈值，用来重新“武装”检测 */
@@ -108,6 +162,27 @@ static TouchState touch_state = {0U, 0U, 0U, 0U, 0U};
 static UiPage current_page = UI_PAGE_HOME;
 static uint8_t page_dirty = 1U;                          /* 切页后需要重画静态内容 */
 static uint8_t touch_was_pressed = 0U;                   /* 用于检测一次新的按下动作 */
+static uint8_t measurement_running = 0U;
+static UiPage measurement_page = UI_PAGE_HOME;
+static uint32_t measurement_start_tick = 0U;
+static uint32_t measurement_last_sample_tick = 0U;
+static uint32_t frequency_samples[RUN_MAX_SAMPLES];
+static int32_t difference_samples[RUN_MAX_SAMPLES];
+static uint16_t frequency_sample_count = 0U;
+static uint16_t difference_sample_count = 0U;
+static UiMeasurementResult measurement_results[4];
+static DoubleCalibrationData double_calibration;
+static SingleCalibrationData single_calibration;
+static char calibration_value_input[10];
+static uint8_t calibration_value_input_length = 0U;
+static char calibration_length_input[8];
+static uint8_t calibration_input_length = 0U;
+static uint8_t calibration_active_field = 0U;             /* 0频率/电阻输入，1线长输入 */
+static uint8_t calibration_status = 0U;                  /* 0空闲，1已添加，2已保存，3输入错误，4数据不足 */
+static uint8_t spi_flash_ready = 0U;
+static uint16_t spi_flash_id = 0U;
+static uint8_t calibration_mode = 0U;                    /* 0单端校准，1双端校准 */
+static uint8_t calibration_selected_point = 0U;
 
 /* USER CODE END PV */
 
@@ -126,12 +201,36 @@ static void Ui_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t p
 static void Ui_HandleTouch(const TouchState *state);
 static void Ui_DrawPageStatic(void);
 static void Ui_DrawNavigation(void);
+static void Ui_DrawRunButton(void);
+static void Ui_DrawHomeValues(const UiMeasurementResult *result);
+static void Ui_DrawCalibrationPage(void);
+static void Ui_DrawCalibrationValues(void);
+static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y);
 static void Ui_DrawSingleValue(uint32_t pa1_freq);
-static void Ui_DrawDoubleValues(uint16_t value1, uint16_t value2);
+static void Ui_DrawDoubleValue(int32_t difference);
 static void Ui_DrawLargeFrequency(uint16_t x, uint16_t y, uint32_t freq);
 static void Ui_DrawSignedValue(uint16_t x, uint16_t y, int32_t value, uint8_t size);
 static uint16_t CalculateLengthX10(uint32_t frequency);
 static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10);
+static void Measurement_Start(uint32_t now);
+static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2);
+static uint32_t MedianU32(uint32_t *values, uint16_t count);
+static int32_t MedianS32(int32_t *values, uint16_t count);
+static float DifferenceToResistance(int32_t difference);
+static uint8_t Calibration_Fit(void);
+static uint8_t SingleCalibration_Fit(void);
+static float Calibration_ParseText(const char *text, uint8_t text_length);
+static float Calibration_ParseValue(void);
+static float Calibration_ParseLength(void);
+static void Calibration_AppendKey(char key);
+static uint8_t Calibration_AddPoint(void);
+static void Calibration_DeletePoint(void);
+static void Calibration_SelectPoint(int8_t direction);
+static uint8_t Calibration_Save(void);
+static void Calibration_Load(void);
+static uint32_t Calibration_Checksum(const CalibrationStorage *data);
+static uint8_t Calibration_GetLength(float resistance_ohm, float *length_m);
+static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m);
 void App_Init(void);
 void App_TaskStep(void);
 
@@ -177,6 +276,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_DAC_Init();
   MX_FSMC_Init();
+  MX_SPI1_Init();
   MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
 
@@ -255,6 +355,7 @@ void App_Init(void)
   scalar_kalman_init(&adc1_kalman, 1.0f, 1.0f, ADC_KALMAN_Q, ADC_KALMAN_R);
   scalar_kalman_init(&adc2_kalman, 1.0f, 1.0f, ADC_KALMAN_Q, ADC_KALMAN_R);
   scalar_kalman_init(&pa1_freq_kalman, 1.0f, 1.0f, PA1_KALMAN_Q, PA1_KALMAN_R);
+  Calibration_Load();
 
   Ui_Init();
   Touch_Init();
@@ -291,6 +392,9 @@ void App_TaskStep(void)
   uint32_t adc1_freq = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
   uint32_t adc2_freq = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
 
+  /* RUN 测量按固定周期收集滤波后的数据，满 4 秒后计算中位数。 */
+  Measurement_Update(now, pa1_freq, adc1_value, adc2_value);
+
   if ((now - last_touch_tick) >= 20U)
   {
     last_touch_tick = now;
@@ -301,7 +405,7 @@ void App_TaskStep(void)
   /* DAC 输出跟随 ADC：ADC1 -> DAC1(PA4)，ADC2 -> DAC2(PA5) */
   UpdateDacOutputs(adc1_value, adc2_value);
 
-  /* LCD 不需要每 1ms 都刷，函数内部会按 LCD_REFRESH_PERIOD_MS 限速 */
+  /* LCD 只在页面状态改变时重画，避免数值区域持续刷新产生频闪。 */
   Ui_Update(now, adc1_value, adc2_value, pa1_freq);
 
   if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
@@ -441,41 +545,571 @@ static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa1_freq
   }
 }
 
+static void Measurement_Start(uint32_t now)
+{
+  measurement_page = current_page;
+  measurement_start_tick = now;
+  measurement_last_sample_tick = now - RUN_SAMPLE_PERIOD_MS;
+  frequency_sample_count = 0U;
+  difference_sample_count = 0U;
+  measurement_results[measurement_page].valid = 0U;
+  measurement_results[measurement_page].frequency_valid = 0U;
+  measurement_running = 1U;
+  page_dirty = 1U;
+}
+
+static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2)
+{
+  UiMeasurementResult *result;
+
+  if (measurement_running == 0U)
+  {
+    return;
+  }
+
+  if ((now - measurement_last_sample_tick) >= RUN_SAMPLE_PERIOD_MS)
+  {
+    measurement_last_sample_tick = now;
+
+    if (difference_sample_count < RUN_MAX_SAMPLES)
+    {
+      difference_samples[difference_sample_count++] = (int32_t)value1 - (int32_t)value2;
+    }
+
+    if ((pa1_freq != 0U) && (frequency_sample_count < RUN_MAX_SAMPLES))
+    {
+      frequency_samples[frequency_sample_count++] = pa1_freq;
+    }
+  }
+
+  if ((now - measurement_start_tick) < RUN_DURATION_MS)
+  {
+    return;
+  }
+
+  result = &measurement_results[measurement_page];
+  result->frequency_valid = (frequency_sample_count != 0U) ? 1U : 0U;
+  result->frequency_hz = (frequency_sample_count != 0U) ? MedianU32(frequency_samples, frequency_sample_count) : 0U;
+  result->difference = (difference_sample_count != 0U) ? MedianS32(difference_samples, difference_sample_count) : 0;
+
+  if (measurement_page == UI_PAGE_SINGLE)
+  {
+    result->valid = result->frequency_valid;
+  }
+  else
+  {
+    result->valid = (difference_sample_count != 0U) ? 1U : 0U;
+  }
+
+  measurement_running = 0U;
+  page_dirty = 1U;
+}
+
+static uint32_t MedianU32(uint32_t *values, uint16_t count)
+{
+  for (uint16_t i = 1U; i < count; ++i)
+  {
+    uint32_t key = values[i];
+    uint16_t j = i;
+
+    while ((j > 0U) && (values[j - 1U] > key))
+    {
+      values[j] = values[j - 1U];
+      --j;
+    }
+
+    values[j] = key;
+  }
+
+  if ((count & 1U) != 0U)
+  {
+    return values[count / 2U];
+  }
+
+  return (uint32_t)(((uint64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2U);
+}
+
+static int32_t MedianS32(int32_t *values, uint16_t count)
+{
+  for (uint16_t i = 1U; i < count; ++i)
+  {
+    int32_t key = values[i];
+    uint16_t j = i;
+
+    while ((j > 0U) && (values[j - 1U] > key))
+    {
+      values[j] = values[j - 1U];
+      --j;
+    }
+
+    values[j] = key;
+  }
+
+  if ((count & 1U) != 0U)
+  {
+    return values[count / 2U];
+  }
+
+  return (int32_t)(((int64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2);
+}
+
+static float DifferenceToResistance(int32_t difference)
+{
+  uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
+  return ((float)absolute_difference * DIFF_VOLTAGE_SCALE) / MEASURE_CURRENT_MA;
+}
+
+static uint8_t Calibration_Fit(void)
+{
+  float sum_x = 0.0f;
+  float sum_y = 0.0f;
+  float sum_xx = 0.0f;
+  float sum_xy = 0.0f;
+  float denominator;
+  float count = (float)double_calibration.point_count;
+
+  if (double_calibration.point_count < 2U)
+  {
+    return 0U;
+  }
+
+  for (uint32_t i = 0U; i < double_calibration.point_count; ++i)
+  {
+    float x = double_calibration.length_m[i];
+    float y = double_calibration.resistance_ohm[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  denominator = count * sum_xx - sum_x * sum_x;
+  if ((denominator > -0.0001f) && (denominator < 0.0001f))
+  {
+    return 0U;
+  }
+
+  double_calibration.resistance_per_meter = (count * sum_xy - sum_x * sum_y) / denominator;
+  double_calibration.zero_resistance = (sum_y - double_calibration.resistance_per_meter * sum_x) / count;
+
+  return (double_calibration.resistance_per_meter > 0.000001f) ? 1U : 0U;
+}
+
+static uint8_t SingleCalibration_Fit(void)
+{
+  float sum_x = 0.0f;
+  float sum_y = 0.0f;
+  float sum_xx = 0.0f;
+  float sum_xy = 0.0f;
+  float denominator;
+  float count = (float)single_calibration.point_count;
+
+  if (single_calibration.point_count < 2U)
+  {
+    return 0U;
+  }
+
+  for (uint32_t i = 0U; i < single_calibration.point_count; ++i)
+  {
+    float x = 1000000.0f / (float)single_calibration.frequency_hz[i];
+    float y = single_calibration.length_m[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  denominator = count * sum_xx - sum_x * sum_x;
+  if ((denominator > -0.0001f) && (denominator < 0.0001f))
+  {
+    return 0U;
+  }
+
+  single_calibration.inverse_period_slope = (count * sum_xy - sum_x * sum_y) / denominator;
+  single_calibration.offset_m = (sum_y - single_calibration.inverse_period_slope * sum_x) / count;
+
+  return (single_calibration.inverse_period_slope > 0.000001f) ? 1U : 0U;
+}
+
+static float Calibration_ParseText(const char *text, uint8_t text_length)
+{
+  float value = 0.0f;
+  float decimal_scale = 0.1f;
+  uint8_t after_decimal = 0U;
+
+  for (uint8_t i = 0U; i < text_length; ++i)
+  {
+    char character = text[i];
+
+    if (character == '.')
+    {
+      after_decimal = 1U;
+    }
+    else if ((character >= '0') && (character <= '9'))
+    {
+      if (after_decimal == 0U)
+      {
+        value = value * 10.0f + (float)(character - '0');
+      }
+      else
+      {
+        value += (float)(character - '0') * decimal_scale;
+        decimal_scale *= 0.1f;
+      }
+    }
+  }
+
+  return value;
+}
+
+static float Calibration_ParseValue(void)
+{
+  return Calibration_ParseText(calibration_value_input, calibration_value_input_length);
+}
+
+static float Calibration_ParseLength(void)
+{
+  return Calibration_ParseText(calibration_length_input, calibration_input_length);
+}
+
+static void Calibration_AppendKey(char key)
+{
+  char *input = (calibration_active_field == 0U) ? calibration_value_input : calibration_length_input;
+  uint8_t *input_length = (calibration_active_field == 0U) ?
+                          &calibration_value_input_length : &calibration_input_length;
+  uint8_t input_capacity = (calibration_active_field == 0U) ?
+                           (uint8_t)sizeof(calibration_value_input) : (uint8_t)sizeof(calibration_length_input);
+  uint8_t has_decimal = 0U;
+
+  calibration_status = 0U;
+
+  if (key == '<')
+  {
+    if (*input_length != 0U)
+    {
+      (*input_length)--;
+      input[*input_length] = '\0';
+    }
+    return;
+  }
+
+  if (key == '.')
+  {
+    for (uint8_t i = 0U; i < *input_length; ++i)
+    {
+      if (input[i] == '.')
+      {
+        has_decimal = 1U;
+      }
+    }
+
+    if (has_decimal != 0U)
+    {
+      return;
+    }
+
+    if (*input_length == 0U)
+    {
+      input[(*input_length)++] = '0';
+    }
+  }
+
+  if (*input_length < (input_capacity - 1U))
+  {
+    input[(*input_length)++] = key;
+    input[*input_length] = '\0';
+  }
+}
+
+static uint8_t Calibration_AddPoint(void)
+{
+  float measured_value = Calibration_ParseValue();
+  float length_m = Calibration_ParseLength();
+
+  if ((measured_value <= 0.0f) || (length_m <= 0.0f) || (length_m > 1000.0f))
+  {
+    return 0U;
+  }
+
+  if (calibration_mode == 0U)
+  {
+    if ((measured_value > 1000000.0f) || (single_calibration.point_count >= CALIBRATION_MAX_POINTS))
+    {
+      return 0U;
+    }
+
+    single_calibration.length_m[single_calibration.point_count] = length_m;
+    single_calibration.frequency_hz[single_calibration.point_count] = (uint32_t)(measured_value + 0.5f);
+    single_calibration.point_count++;
+
+    calibration_selected_point = (uint8_t)(single_calibration.point_count - 1U);
+  }
+  else
+  {
+    if ((measured_value > 10000.0f) || (double_calibration.point_count >= CALIBRATION_MAX_POINTS))
+    {
+      return 0U;
+    }
+
+    double_calibration.length_m[double_calibration.point_count] = length_m;
+    double_calibration.resistance_ohm[double_calibration.point_count] = measured_value;
+    double_calibration.point_count++;
+
+    calibration_selected_point = (uint8_t)(double_calibration.point_count - 1U);
+  }
+
+  calibration_value_input_length = 0U;
+  calibration_value_input[0] = '\0';
+  calibration_input_length = 0U;
+  calibration_length_input[0] = '\0';
+  return 1U;
+}
+
+static void Calibration_DeletePoint(void)
+{
+  if (calibration_mode == 0U)
+  {
+    if (single_calibration.point_count == 0U)
+    {
+      return;
+    }
+
+    for (uint32_t i = calibration_selected_point; i + 1U < single_calibration.point_count; ++i)
+    {
+      single_calibration.length_m[i] = single_calibration.length_m[i + 1U];
+      single_calibration.frequency_hz[i] = single_calibration.frequency_hz[i + 1U];
+    }
+    single_calibration.point_count--;
+    if (single_calibration.point_count >= 2U)
+    {
+      (void)SingleCalibration_Fit();
+    }
+  }
+  else
+  {
+    if (double_calibration.point_count == 0U)
+    {
+      return;
+    }
+
+    for (uint32_t i = calibration_selected_point; i + 1U < double_calibration.point_count; ++i)
+    {
+      double_calibration.length_m[i] = double_calibration.length_m[i + 1U];
+      double_calibration.resistance_ohm[i] = double_calibration.resistance_ohm[i + 1U];
+    }
+    double_calibration.point_count--;
+    if (double_calibration.point_count >= 2U)
+    {
+      (void)Calibration_Fit();
+    }
+  }
+
+  {
+    uint32_t count = (calibration_mode == 0U) ? single_calibration.point_count : double_calibration.point_count;
+    if (count == 0U)
+    {
+      calibration_selected_point = 0U;
+    }
+    else if (calibration_selected_point >= count)
+    {
+      calibration_selected_point = (uint8_t)(count - 1U);
+    }
+  }
+}
+
+static void Calibration_SelectPoint(int8_t direction)
+{
+  uint32_t count = (calibration_mode == 0U) ? single_calibration.point_count : double_calibration.point_count;
+
+  if (count == 0U)
+  {
+    calibration_selected_point = 0U;
+  }
+  else if (direction < 0)
+  {
+    calibration_selected_point = (calibration_selected_point == 0U) ?
+                                 (uint8_t)(count - 1U) : (uint8_t)(calibration_selected_point - 1U);
+  }
+  else
+  {
+    calibration_selected_point = (uint8_t)((calibration_selected_point + 1U) % count);
+  }
+}
+
+static uint32_t Calibration_Checksum(const CalibrationStorage *data)
+{
+  const uint32_t *words = (const uint32_t *)data;
+  uint32_t checksum = 2166136261UL;
+  uint32_t word_count = (sizeof(CalibrationStorage) / sizeof(uint32_t)) - 1U;
+
+  for (uint32_t i = 0U; i < word_count; ++i)
+  {
+    checksum ^= words[i];
+    checksum *= 16777619UL;
+  }
+
+  return checksum;
+}
+
+static uint8_t Calibration_Save(void)
+{
+  CalibrationStorage storage = {0};
+  CalibrationStorage verify = {0};
+
+  if (spi_flash_ready == 0U)
+  {
+    return 0U;
+  }
+
+  if ((single_calibration.point_count >= 2U) && (SingleCalibration_Fit() == 0U))
+  {
+    single_calibration.inverse_period_slope = 0.0f;
+    single_calibration.offset_m = 0.0f;
+  }
+
+  if ((double_calibration.point_count >= 2U) && (Calibration_Fit() == 0U))
+  {
+    double_calibration.resistance_per_meter = 0.0f;
+    double_calibration.zero_resistance = 0.0f;
+  }
+
+  storage.magic = CALIBRATION_MAGIC;
+  storage.version = CALIBRATION_VERSION;
+  storage.single = single_calibration;
+  storage.double_end = double_calibration;
+  storage.checksum = Calibration_Checksum(&storage);
+
+  if (SpiFlash_WriteSector(CALIBRATION_FLASH_ADDRESS, (const uint8_t *)&storage,
+                           (uint16_t)sizeof(storage)) == 0U)
+  {
+    return 0U;
+  }
+
+  if (SpiFlash_Read(CALIBRATION_FLASH_ADDRESS, (uint8_t *)&verify, (uint16_t)sizeof(verify)) == 0U)
+  {
+    return 0U;
+  }
+
+  return ((verify.magic == CALIBRATION_MAGIC) &&
+          (verify.checksum == Calibration_Checksum(&verify))) ? 1U : 0U;
+}
+
+static void Calibration_Load(void)
+{
+  CalibrationStorage stored = {0};
+
+  spi_flash_ready = SpiFlash_Init();
+  if (spi_flash_ready != 0U)
+  {
+    spi_flash_id = SpiFlash_ReadId();
+    spi_flash_ready = ((spi_flash_id != 0U) && (spi_flash_id != 0xFFFFU)) ? 1U : 0U;
+  }
+
+  if ((spi_flash_ready == 0U) ||
+      (SpiFlash_Read(CALIBRATION_FLASH_ADDRESS, (uint8_t *)&stored, (uint16_t)sizeof(stored)) == 0U))
+  {
+    return;
+  }
+
+  if ((stored.magic == CALIBRATION_MAGIC) &&
+      (stored.version == CALIBRATION_VERSION) &&
+      (stored.single.point_count <= CALIBRATION_MAX_POINTS) &&
+      (stored.double_end.point_count <= CALIBRATION_MAX_POINTS) &&
+      (stored.checksum == Calibration_Checksum(&stored)))
+  {
+    single_calibration = stored.single;
+    double_calibration = stored.double_end;
+  }
+}
+
+static uint8_t Calibration_GetLength(float resistance_ohm, float *length_m)
+{
+  if ((length_m == NULL) || (double_calibration.point_count < 2U) ||
+      (double_calibration.resistance_per_meter <= 0.000001f))
+  {
+    return 0U;
+  }
+
+  *length_m = (resistance_ohm - double_calibration.zero_resistance) /
+              double_calibration.resistance_per_meter;
+
+  if (*length_m < 0.0f)
+  {
+    *length_m = 0.0f;
+  }
+  else if (*length_m > 1000.0f)
+  {
+    *length_m = 1000.0f;
+  }
+
+  return 1U;
+}
+
+static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m)
+{
+  if ((length_m == NULL) || (frequency_hz == 0U) || (single_calibration.point_count < 2U) ||
+      (single_calibration.inverse_period_slope <= 0.000001f))
+  {
+    return 0U;
+  }
+
+  *length_m = single_calibration.inverse_period_slope * (1000000.0f / (float)frequency_hz) +
+              single_calibration.offset_m;
+  if (*length_m < 0.0f)
+  {
+    *length_m = 0.0f;
+  }
+  else if (*length_m > 1000.0f)
+  {
+    *length_m = 1000.0f;
+  }
+
+  return 1U;
+}
+
 static void Ui_Init(void)
 {
   LCD_Init();
   current_page = UI_PAGE_HOME;
   page_dirty = 1U;
-  Ui_DrawPageStatic();
-  page_dirty = 0U;
 }
 
 static void Ui_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa1_freq)
 {
-  static uint32_t last_lcd_tick = 0U;
-  uint8_t page_redrawn = 0U;
+  const UiMeasurementResult *result;
 
-  if (page_dirty != 0U)
-  {
-    Ui_DrawPageStatic();
-    page_dirty = 0U;
-    page_redrawn = 1U;
-  }
+  (void)now;
+  (void)value1;
+  (void)value2;
+  (void)pa1_freq;
 
-  if ((page_redrawn == 0U) && ((now - last_lcd_tick) < LCD_REFRESH_PERIOD_MS))
+  /* 数值只在切页、开始测量或测量完成时重画，避免周期性清屏造成频闪。 */
+  if (page_dirty == 0U)
   {
     return;
   }
 
-  last_lcd_tick = now;
+  Ui_DrawPageStatic();
+  page_dirty = 0U;
 
-  if (current_page == UI_PAGE_SINGLE)
+  if (measurement_running != 0U)
   {
-    Ui_DrawSingleValue(pa1_freq);
+    return;
+  }
+
+  result = &measurement_results[current_page];
+
+  if (current_page == UI_PAGE_HOME)
+  {
+    Ui_DrawHomeValues(result);
+  }
+  else if (current_page == UI_PAGE_SINGLE)
+  {
+    Ui_DrawSingleValue(result->frequency_valid != 0U ? result->frequency_hz : 0U);
   }
   else if (current_page == UI_PAGE_DOUBLE)
   {
-    Ui_DrawDoubleValues(value1, value2);
+    Ui_DrawDoubleValue(result->valid != 0U ? result->difference : 0);
   }
 }
 
@@ -488,26 +1122,46 @@ static void Ui_HandleTouch(const TouchState *state)
     return;
   }
 
-  /* 只响应一次新的按下动作，避免手指按住时重复切页 */
-  if ((state->pressed != 0U) && (touch_was_pressed == 0U) && (state->y >= UI_NAV_TOP))
+  /* 只响应一次新的按下动作，避免手指按住时重复触发。 */
+  if ((state->pressed != 0U) && (touch_was_pressed == 0U))
   {
-    if (state->x <= UI_NAV_HOME_RIGHT)
+    if ((current_page != UI_PAGE_CALIBRATION) &&
+        (state->x >= UI_RUN_LEFT) && (state->x <= UI_RUN_RIGHT) &&
+        (state->y >= UI_RUN_TOP) && (state->y <= UI_RUN_BOTTOM))
     {
-      new_page = UI_PAGE_HOME;
+      if (measurement_running == 0U)
+      {
+        Measurement_Start(HAL_GetTick());
+      }
     }
-    else if (state->x <= UI_NAV_SINGLE_RIGHT)
+    else if ((measurement_running == 0U) && (current_page == UI_PAGE_CALIBRATION) && (state->y < UI_NAV_TOP))
     {
-      new_page = UI_PAGE_SINGLE;
+      Ui_HandleCalibrationTouch(state->x, state->y);
     }
-    else
+    else if ((measurement_running == 0U) && (state->y >= UI_NAV_TOP))
     {
-      new_page = UI_PAGE_DOUBLE;
-    }
+      if (state->x <= UI_NAV_HOME_RIGHT)
+      {
+        new_page = UI_PAGE_HOME;
+      }
+      else if (state->x <= UI_NAV_SINGLE_RIGHT)
+      {
+        new_page = UI_PAGE_SINGLE;
+      }
+      else if (state->x <= UI_NAV_DOUBLE_RIGHT)
+      {
+        new_page = UI_PAGE_DOUBLE;
+      }
+      else
+      {
+        new_page = UI_PAGE_CALIBRATION;
+      }
 
-    if (new_page != current_page)
-    {
-      current_page = new_page;
-      page_dirty = 1U;
+      if (new_page != current_page)
+      {
+        current_page = new_page;
+        page_dirty = 1U;
+      }
     }
   }
 
@@ -520,7 +1174,15 @@ static void Ui_DrawPageStatic(void)
   BACK_COLOR = WHITE;
   LCD_Clear(WHITE);
 
-  if (current_page == UI_PAGE_SINGLE)
+  if (current_page == UI_PAGE_HOME)
+  {
+    LCD_ShowString(70, 12, 144, 24, 24, (uint8_t *)"MEASUREMENT");
+    LCD_ShowString(52, 54, 72, 16, 16, (uint8_t *)"FREQ :");
+    LCD_ShowString(52, 88, 72, 16, 16, (uint8_t *)"LENGTH:");
+    LCD_ShowString(52, 122, 72, 16, 16, (uint8_t *)"DIFF :");
+    LCD_ShowString(52, 156, 48, 16, 16, (uint8_t *)"RES :");
+  }
+  else if (current_page == UI_PAGE_SINGLE)
   {
     LCD_ShowString(94, 18, 132, 24, 24, (uint8_t *)"SINGLE END");
     LCD_ShowString(104, 70, 112, 16, 16, (uint8_t *)"P1 FREQUENCY");
@@ -532,13 +1194,313 @@ static void Ui_DrawPageStatic(void)
   else if (current_page == UI_PAGE_DOUBLE)
   {
     LCD_ShowString(94, 12, 132, 24, 24, (uint8_t *)"DOUBLE END");
-    LCD_ShowString(52, 62, 72, 24, 24, (uint8_t *)"DIFF :");
-    LCD_ShowString(52, 105, 72, 24, 24, (uint8_t *)"VOLT :");
-    LCD_ShowString(52, 148, 60, 24, 24, (uint8_t *)"RES :");
+    LCD_ShowString(52, 52, 48, 16, 16, (uint8_t *)"DIFF:");
+    LCD_ShowString(52, 84, 48, 16, 16, (uint8_t *)"VOLT:");
+    LCD_ShowString(52, 116, 40, 16, 16, (uint8_t *)"RES:");
+    LCD_ShowString(52, 148, 56, 16, 16, (uint8_t *)"LENGTH:");
   }
-  /* 首页内容区按需求暂时留空。 */
+  else
+  {
+    Ui_DrawCalibrationPage();
+  }
 
+  if (current_page != UI_PAGE_CALIBRATION)
+  {
+    Ui_DrawRunButton();
+  }
   Ui_DrawNavigation();
+}
+
+static void Ui_DrawRunButton(void)
+{
+  uint8_t is_running_page = (measurement_running != 0U) && (measurement_page == current_page);
+
+  LCD_Fill(UI_RUN_LEFT, UI_RUN_TOP, UI_RUN_RIGHT, UI_RUN_BOTTOM, is_running_page != 0U ? RED : BLUE);
+  POINT_COLOR = WHITE;
+  BACK_COLOR = is_running_page != 0U ? RED : BLUE;
+
+  if (is_running_page != 0U)
+  {
+    LCD_ShowString(252, 17, 48, 16, 16, (uint8_t *)"WAIT");
+  }
+  else
+  {
+    LCD_ShowString(262, 17, 24, 16, 16, (uint8_t *)"RUN");
+  }
+
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+}
+
+static void Ui_DrawCalibrationPage(void)
+{
+  static const char keys[4][3] = {
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'.', '0', '<'}
+  };
+
+  LCD_Fill(8, 8, 62, 30, calibration_mode == 0U ? BLUE : WHITE);
+  POINT_COLOR = calibration_mode == 0U ? WHITE : BLACK;
+  BACK_COLOR = calibration_mode == 0U ? BLUE : WHITE;
+  LCD_ShowString(15, 12, 40, 12, 12, (uint8_t *)"S-CAL");
+  LCD_Fill(68, 8, 128, 30, calibration_mode != 0U ? BLUE : WHITE);
+  POINT_COLOR = calibration_mode != 0U ? WHITE : BLACK;
+  BACK_COLOR = calibration_mode != 0U ? BLUE : WHITE;
+  LCD_ShowString(78, 12, 40, 12, 12, (uint8_t *)"D-CAL");
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+  LCD_ShowString(145, 10, 48, 12, 12,
+                 (uint8_t *)(spi_flash_ready != 0U ? "FL OK" : "FL ERR"));
+  LCD_ShowString(194, 10, 12, 12, 12, (uint8_t *)"I");
+  LCD_ShowNum(208, 10, spi_flash_id, 5, 12);
+
+  LCD_DrawRectangle(8, 140, 45, 164);
+  LCD_ShowString(18, 146, 18, 12, 12, (uint8_t *)"ADD");
+  LCD_DrawRectangle(49, 140, 86, 164);
+  LCD_ShowString(59, 146, 18, 12, 12, (uint8_t *)"DEL");
+  LCD_DrawRectangle(90, 140, 128, 164);
+  LCD_ShowString(96, 146, 30, 12, 12, (uint8_t *)"SAVE");
+  LCD_DrawRectangle(8, 170, 45, 194);
+  LCD_ShowString(12, 176, 30, 12, 12, (uint8_t *)"PREV");
+  LCD_DrawRectangle(49, 170, 86, 194);
+  LCD_ShowString(53, 176, 30, 12, 12, (uint8_t *)"NEXT");
+  LCD_DrawRectangle(90, 170, 128, 194);
+  LCD_ShowString(100, 176, 18, 12, 12, (uint8_t *)"CLR");
+
+  for (uint8_t row = 0U; row < 4U; ++row)
+  {
+    for (uint8_t col = 0U; col < 3U; ++col)
+    {
+      uint16_t left = CAL_KEYPAD_LEFT + (uint16_t)col * CAL_KEY_WIDTH;
+      uint16_t top = CAL_KEYPAD_TOP + (uint16_t)row * CAL_KEY_HEIGHT;
+      char label[2] = {keys[row][col], '\0'};
+
+      LCD_DrawRectangle(left, top, left + CAL_KEY_WIDTH - 1U, top + CAL_KEY_HEIGHT - 1U);
+      LCD_ShowString(left + 25U, top + 10U, 12, 16, 16, (uint8_t *)label);
+    }
+  }
+
+  Ui_DrawCalibrationValues();
+}
+
+static void Ui_DrawCalibrationValues(void)
+{
+  uint32_t point_count = (calibration_mode == 0U) ? single_calibration.point_count : double_calibration.point_count;
+  uint32_t value_x100;
+
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+  LCD_Fill(8, 32, 136, 136, WHITE);
+
+  POINT_COLOR = (calibration_active_field == 0U) ? BLUE : GRAY;
+  LCD_DrawRectangle(5, 32, 132, 54);
+  POINT_COLOR = (calibration_active_field == 1U) ? BLUE : GRAY;
+  LCD_DrawRectangle(5, 56, 132, 78);
+  POINT_COLOR = BLACK;
+
+  if (calibration_mode == 0U)
+  {
+    LCD_ShowString(8, 34, 16, 16, 16, (uint8_t *)"F:");
+  }
+  else
+  {
+    LCD_ShowString(8, 34, 16, 16, 16, (uint8_t *)"R:");
+  }
+
+  if (calibration_value_input_length != 0U)
+  {
+    LCD_ShowString(28, 34, 80, 16, 16, (uint8_t *)calibration_value_input);
+    LCD_ShowString(104, 34, 24, 16, 16,
+                   (uint8_t *)(calibration_mode == 0U ? "Hz" : "ohm"));
+  }
+  else
+  {
+    LCD_ShowString(28, 34, 72, 16, 16,
+                   (uint8_t *)(calibration_mode == 0U ? "---Hz" : "--ohm"));
+  }
+
+  LCD_ShowString(8, 58, 16, 16, 16, (uint8_t *)"L:");
+  if (calibration_input_length != 0U)
+  {
+    LCD_ShowString(28, 58, 96, 16, 16, (uint8_t *)calibration_length_input);
+    LCD_ShowString(112, 58, 8, 16, 16, (uint8_t *)"m");
+  }
+  else
+  {
+    LCD_ShowString(28, 58, 48, 16, 16, (uint8_t *)"--.-m");
+  }
+
+  LCD_ShowString(8, 82, 16, 16, 16, (uint8_t *)"P:");
+  if (point_count != 0U)
+  {
+    LCD_ShowNum(28, 82, calibration_selected_point + 1U, 1, 16);
+    LCD_ShowString(40, 82, 8, 16, 16, (uint8_t *)"/");
+    LCD_ShowNum(48, 82, point_count, 1, 16);
+
+    if (calibration_mode == 0U)
+    {
+      LCD_ShowString(8, 104, 18, 12, 12, (uint8_t *)"PF:");
+      LCD_ShowNum(28, 104, single_calibration.frequency_hz[calibration_selected_point], 6, 12);
+      LCD_ShowString(8, 120, 18, 12, 12, (uint8_t *)"PL:");
+      value_x100 = (uint32_t)(single_calibration.length_m[calibration_selected_point] * 100.0f + 0.5f);
+    }
+    else
+    {
+      LCD_ShowString(8, 104, 18, 12, 12, (uint8_t *)"PR:");
+      value_x100 = (uint32_t)(double_calibration.resistance_ohm[calibration_selected_point] * 100.0f + 0.5f);
+      LCD_ShowNum(28, 104, value_x100 / 100U, 2, 12);
+      LCD_ShowString(40, 104, 6, 12, 12, (uint8_t *)".");
+      LCD_ShowxNum(46, 104, value_x100 % 100U, 2, 12, 0x80U);
+      LCD_ShowString(8, 120, 18, 12, 12, (uint8_t *)"PL:");
+      value_x100 = (uint32_t)(double_calibration.length_m[calibration_selected_point] * 100.0f + 0.5f);
+    }
+
+    LCD_ShowNum(28, 120, value_x100 / 100U, 3, 12);
+    LCD_ShowString(46, 120, 6, 12, 12, (uint8_t *)".");
+    LCD_ShowxNum(52, 120, value_x100 % 100U, 2, 12, 0x80U);
+  }
+  else
+  {
+    LCD_ShowString(28, 82, 18, 16, 16, (uint8_t *)"0/0");
+  }
+
+  if (calibration_status == 1U)
+  {
+    LCD_ShowString(92, 120, 36, 12, 12, (uint8_t *)"ADDED");
+  }
+  else if (calibration_status == 2U)
+  {
+    LCD_ShowString(92, 120, 36, 12, 12, (uint8_t *)"SAVED");
+  }
+  else if (calibration_status == 3U)
+  {
+    LCD_ShowString(92, 120, 24, 12, 12, (uint8_t *)"ERR");
+  }
+  else if (calibration_status == 4U)
+  {
+    LCD_ShowString(92, 120, 24, 12, 12, (uint8_t *)"NEED");
+  }
+  else if (calibration_status == 5U)
+  {
+    LCD_ShowString(92, 120, 30, 12, 12, (uint8_t *)"FLASH");
+  }
+}
+
+static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y)
+{
+  static const char keys[4][3] = {
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'.', '0', '<'}
+  };
+
+  if ((y >= 8U) && (y <= 30U) && (x >= 8U) && (x <= 128U))
+  {
+    calibration_mode = (x <= 62U) ? 0U : 1U;
+    calibration_selected_point = 0U;
+    calibration_active_field = 0U;
+    calibration_value_input_length = 0U;
+    calibration_value_input[0] = '\0';
+    calibration_input_length = 0U;
+    calibration_length_input[0] = '\0';
+    calibration_status = 0U;
+    page_dirty = 1U;
+  }
+  else if ((x >= 5U) && (x <= 132U) && (y >= 32U) && (y <= 54U))
+  {
+    calibration_active_field = 0U;
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 5U) && (x <= 132U) && (y >= 56U) && (y <= 78U))
+  {
+    calibration_active_field = 1U;
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= CAL_KEYPAD_LEFT) && (y >= CAL_KEYPAD_TOP) && (y < 196U))
+  {
+    uint8_t col = (uint8_t)((x - CAL_KEYPAD_LEFT) / CAL_KEY_WIDTH);
+    uint8_t row = (uint8_t)((y - CAL_KEYPAD_TOP) / CAL_KEY_HEIGHT);
+
+    if ((col < 3U) && (row < 4U))
+    {
+      Calibration_AppendKey(keys[row][col]);
+      Ui_DrawCalibrationValues();
+    }
+  }
+  else if ((x >= 8U) && (x <= 45U) && (y >= 140U) && (y <= 164U))
+  {
+    if (Calibration_AddPoint() != 0U)
+    {
+      calibration_value_input_length = 0U;
+      calibration_value_input[0] = '\0';
+      calibration_input_length = 0U;
+      calibration_length_input[0] = '\0';
+      calibration_status = 1U;
+    }
+    else
+    {
+      calibration_status = 3U;
+    }
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 49U) && (x <= 86U) && (y >= 140U) && (y <= 164U))
+  {
+    Calibration_DeletePoint();
+    calibration_status = 0U;
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 90U) && (x <= 128U) && (y >= 140U) && (y <= 164U))
+  {
+    uint32_t count = (calibration_mode == 0U) ? single_calibration.point_count : double_calibration.point_count;
+    if (count == 0U)
+    {
+      calibration_status = 4U;
+    }
+    else if (spi_flash_ready == 0U)
+    {
+      calibration_status = 5U;
+    }
+    else
+    {
+      calibration_status = Calibration_Save() != 0U ? 2U : 3U;
+    }
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 8U) && (x <= 45U) && (y >= 170U) && (y <= 194U))
+  {
+    Calibration_SelectPoint(-1);
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 49U) && (x <= 86U) && (y >= 170U) && (y <= 194U))
+  {
+    Calibration_SelectPoint(1);
+    Ui_DrawCalibrationValues();
+  }
+  else if ((x >= 90U) && (x <= 128U) && (y >= 170U) && (y <= 194U))
+  {
+    if (calibration_mode == 0U)
+    {
+      single_calibration.point_count = 0U;
+      single_calibration.inverse_period_slope = 0.0f;
+      single_calibration.offset_m = 0.0f;
+    }
+    else
+    {
+      double_calibration.point_count = 0U;
+      double_calibration.resistance_per_meter = 0.0f;
+      double_calibration.zero_resistance = 0.0f;
+    }
+    calibration_selected_point = 0U;
+    calibration_value_input_length = 0U;
+    calibration_value_input[0] = '\0';
+    calibration_input_length = 0U;
+    calibration_length_input[0] = '\0';
+    calibration_status = 0U;
+    Ui_DrawCalibrationValues();
+  }
 }
 
 static void Ui_DrawNavigation(void)
@@ -552,30 +1514,80 @@ static void Ui_DrawNavigation(void)
   {
     LCD_Fill(UI_NAV_HOME_RIGHT + 1U, UI_NAV_TOP, UI_NAV_SINGLE_RIGHT, UI_NAV_BOTTOM, BLUE);
   }
+  else if (current_page == UI_PAGE_DOUBLE)
+  {
+    LCD_Fill(UI_NAV_SINGLE_RIGHT + 1U, UI_NAV_TOP, UI_NAV_DOUBLE_RIGHT, UI_NAV_BOTTOM, BLUE);
+  }
   else
   {
-    LCD_Fill(UI_NAV_SINGLE_RIGHT + 1U, UI_NAV_TOP, 319, UI_NAV_BOTTOM, BLUE);
+    LCD_Fill(UI_NAV_DOUBLE_RIGHT + 1U, UI_NAV_TOP, 319, UI_NAV_BOTTOM, BLUE);
   }
 
   POINT_COLOR = GRAY;
   LCD_DrawRectangle(0, UI_NAV_TOP, 319, UI_NAV_BOTTOM);
   LCD_DrawLine(UI_NAV_HOME_RIGHT, UI_NAV_TOP, UI_NAV_HOME_RIGHT, UI_NAV_BOTTOM);
   LCD_DrawLine(UI_NAV_SINGLE_RIGHT, UI_NAV_TOP, UI_NAV_SINGLE_RIGHT, UI_NAV_BOTTOM);
+  LCD_DrawLine(UI_NAV_DOUBLE_RIGHT, UI_NAV_TOP, UI_NAV_DOUBLE_RIGHT, UI_NAV_BOTTOM);
 
   POINT_COLOR = (current_page == UI_PAGE_HOME) ? WHITE : BLACK;
   BACK_COLOR = (current_page == UI_PAGE_HOME) ? BLUE : WHITE;
-  LCD_ShowString(37, 212, 40, 16, 16, (uint8_t *)"HOME");
+  LCD_ShowString(20, 212, 40, 16, 16, (uint8_t *)"HOME");
 
   POINT_COLOR = (current_page == UI_PAGE_SINGLE) ? WHITE : BLACK;
   BACK_COLOR = (current_page == UI_PAGE_SINGLE) ? BLUE : WHITE;
-  LCD_ShowString(132, 212, 48, 16, 16, (uint8_t *)"SINGLE");
+  LCD_ShowString(94, 212, 48, 16, 16, (uint8_t *)"SINGLE");
 
   POINT_COLOR = (current_page == UI_PAGE_DOUBLE) ? WHITE : BLACK;
   BACK_COLOR = (current_page == UI_PAGE_DOUBLE) ? BLUE : WHITE;
-  LCD_ShowString(239, 212, 48, 16, 16, (uint8_t *)"DOUBLE");
+  LCD_ShowString(166, 212, 48, 16, 16, (uint8_t *)"DOUBLE");
+
+  POINT_COLOR = (current_page == UI_PAGE_CALIBRATION) ? WHITE : BLACK;
+  BACK_COLOR = (current_page == UI_PAGE_CALIBRATION) ? BLUE : WHITE;
+  LCD_ShowString(268, 212, 24, 16, 16, (uint8_t *)"CAL");
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
+}
+
+static void Ui_DrawHomeValues(const UiMeasurementResult *result)
+{
+  uint16_t length_x10;
+  uint32_t absolute_difference;
+  uint32_t resistance_x100;
+
+  if ((result == NULL) || (result->valid == 0U))
+  {
+    return;
+  }
+
+  POINT_COLOR = BLACK;
+  BACK_COLOR = WHITE;
+
+  if (result->frequency_valid != 0U)
+  {
+    LCD_ShowNum(130, 54, result->frequency_hz, 6, 16);
+    LCD_ShowString(182, 54, 16, 16, 16, (uint8_t *)"Hz");
+
+    length_x10 = CalculateLengthX10(result->frequency_hz);
+    LCD_ShowNum(130, 88, length_x10 / 10U, 2, 16);
+    LCD_ShowString(146, 88, 8, 16, 16, (uint8_t *)".");
+    LCD_ShowNum(154, 88, length_x10 % 10U, 1, 16);
+    LCD_ShowString(166, 88, 8, 16, 16, (uint8_t *)"m");
+  }
+  else
+  {
+    LCD_ShowString(130, 54, 72, 16, 16, (uint8_t *)"--- Hz");
+    LCD_ShowString(130, 88, 48, 16, 16, (uint8_t *)"--.-m");
+  }
+
+  Ui_DrawSignedValue(130, 122, result->difference, 16U);
+
+  absolute_difference = (result->difference < 0) ? (uint32_t)(-result->difference) : (uint32_t)result->difference;
+  resistance_x100 = (uint32_t)(((float)absolute_difference * DIFF_VOLTAGE_SCALE / MEASURE_CURRENT_MA) * 100.0f + 0.5f);
+  LCD_ShowNum(130, 156, resistance_x100 / 100U, 2, 16);
+  LCD_ShowString(146, 156, 8, 16, 16, (uint8_t *)".");
+  LCD_ShowxNum(154, 156, resistance_x100 % 100U, 2, 16, 0x80U);
+  LCD_ShowString(174, 156, 24, 16, 16, (uint8_t *)"ohm");
 }
 
 static void Ui_DrawSingleValue(uint32_t pa1_freq)
@@ -596,12 +1608,19 @@ static void Ui_DrawSingleValue(uint32_t pa1_freq)
  */
 static uint16_t CalculateLengthX10(uint32_t frequency)
 {
+  float calibrated_length_m;
   uint32_t reciprocal_x1000;
   uint32_t length_x1000;
 
   if (frequency == 0U)
   {
     return LENGTH_INVALID_X10;
+  }
+
+  if (SingleCalibration_GetLength(frequency, &calibrated_length_m) != 0U)
+  {
+    uint32_t calibrated_x10 = (uint32_t)(calibrated_length_m * 10.0f + 0.5f);
+    return (calibrated_x10 > LENGTH_MAX_X10) ? LENGTH_MAX_X10 : (uint16_t)calibrated_x10;
   }
 
   reciprocal_x1000 = LENGTH_SCALE_X1000 / frequency;
@@ -634,30 +1653,43 @@ static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
   LCD_ShowString(x + 52U, y, 12, 24, 24, (uint8_t *)"m");
 }
 
-static void Ui_DrawDoubleValues(uint16_t value1, uint16_t value2)
+static void Ui_DrawDoubleValue(int32_t difference)
 {
-  int32_t difference = (int32_t)value1 - (int32_t)value2;
   uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
   float voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
-  float resistance_ohm = voltage_mv / MEASURE_CURRENT_MA;
+  float resistance_ohm = DifferenceToResistance(difference);
+  float line_length_m = 0.0f;
   uint32_t voltage_display = (uint32_t)(voltage_mv + 0.5f);
   uint32_t resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
+  uint32_t length_x10;
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
-  LCD_Fill(136, 60, 285, 178, WHITE);
 
   /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
-  Ui_DrawSignedValue(150, 62, difference, 24U);
+  Ui_DrawSignedValue(130, 52, difference, 16U);
 
   /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
-  LCD_ShowNum(150, 105, voltage_display, 4, 24);
-  LCD_ShowString(206, 105, 24, 24, 24, (uint8_t *)"mV");
+  LCD_ShowNum(130, 84, voltage_display, 4, 16);
+  LCD_ShowString(170, 84, 16, 16, 16, (uint8_t *)"mV");
 
-  LCD_ShowNum(150, 148, resistance_x100 / 100U, 2, 24);
-  LCD_ShowString(174, 148, 12, 24, 24, (uint8_t *)".");
-  LCD_ShowxNum(186, 148, resistance_x100 % 100U, 2, 24, 0x80U);
-  LCD_ShowString(214, 148, 36, 24, 24, (uint8_t *)"ohm");
+  LCD_ShowNum(130, 116, resistance_x100 / 100U, 2, 16);
+  LCD_ShowString(146, 116, 8, 16, 16, (uint8_t *)".");
+  LCD_ShowxNum(154, 116, resistance_x100 % 100U, 2, 16, 0x80U);
+  LCD_ShowString(174, 116, 24, 16, 16, (uint8_t *)"ohm");
+
+  if (Calibration_GetLength(resistance_ohm, &line_length_m) != 0U)
+  {
+    length_x10 = (uint32_t)(line_length_m * 10.0f + 0.5f);
+    LCD_ShowNum(130, 148, length_x10 / 10U, 4, 16);
+    LCD_ShowString(162, 148, 8, 16, 16, (uint8_t *)".");
+    LCD_ShowNum(170, 148, length_x10 % 10U, 1, 16);
+    LCD_ShowString(182, 148, 8, 16, 16, (uint8_t *)"m");
+  }
+  else
+  {
+    LCD_ShowString(130, 148, 48, 16, 16, (uint8_t *)"--.-m");
+  }
 }
 
 static void Ui_DrawLargeFrequency(uint16_t x, uint16_t y, uint32_t freq)

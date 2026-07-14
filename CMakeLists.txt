@@ -48,6 +48,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/lcd.c
     Core/Src/touch.c
+    Core/Src/spi_flash.c
 )
 
 # Add include paths
