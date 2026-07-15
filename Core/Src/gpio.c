@@ -94,7 +94,7 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin : IN3_Pin */
   GPIO_InitStruct.Pin = IN3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(IN3_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : TOUCH_CLK_Pin SPI_FLASH_CS_Pin */
@@ -127,7 +127,7 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin : IN_GND_Pin */
   GPIO_InitStruct.Pin = IN_GND_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(IN_GND_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : IN4_Pin IN5_Pin IN6_Pin IN7_Pin
@@ -135,7 +135,7 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = IN4_Pin|IN5_Pin|IN6_Pin|IN7_Pin
                           |IN8_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 }
