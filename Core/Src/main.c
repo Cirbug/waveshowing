@@ -34,7 +34,11 @@
 #include "touch.h"
 #include "scalar_kalman.h"
 #include "spi_flash.h"
-#include "cable_gpio.h"
+#include "cable_test_manager.h"
+#include "run_measurement.h"
+#include "calibration_model.h"
+#include "double_end_measurement.h"
+#include "measurement_math.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -58,14 +62,6 @@ typedef enum
 
 typedef enum
 {
-  CABLE_WIRING_UNKNOWN = 0,
-  CABLE_WIRING_STRAIGHT,
-  CABLE_WIRING_CROSS,
-  CABLE_WIRING_FAULT
-} CableWiringType;
-
-typedef enum
-{
   CAL_AUTO_NONE = 0,
   CAL_AUTO_ZERO,
   CAL_AUTO_REFERENCE
@@ -75,35 +71,10 @@ typedef struct
 {
   uint8_t valid;
   uint8_t frequency_valid;
-  uint8_t cable_valid;
-  uint8_t cable_shielded;
-  uint8_t cable_output_mask;
-  uint8_t cable_out1_mask;
-  uint8_t cable_out2_mask;
-  CableWiringType cable_wiring;
   uint32_t frequency_hz;
   int32_t difference;
+  DoubleEndMeasurementResult double_end;
 } UiMeasurementResult;
-
-#define CALIBRATION_MAX_POINTS 5U
-
-typedef struct
-{
-  uint32_t point_count;
-  float length_m[CALIBRATION_MAX_POINTS];
-  float resistance_ohm[CALIBRATION_MAX_POINTS];
-  float resistance_per_meter;
-  float zero_resistance;
-} DoubleCalibrationData;
-
-typedef struct
-{
-  uint32_t point_count;
-  float length_m[CALIBRATION_MAX_POINTS];
-  uint32_t frequency_hz[CALIBRATION_MAX_POINTS];
-  float inverse_period_slope;
-  float offset_m;
-} SingleCalibrationData;
 
 typedef struct
 {
@@ -139,9 +110,6 @@ typedef struct
 #define UI_RUN_TOP 8U
 #define UI_RUN_RIGHT 311U
 #define UI_RUN_BOTTOM 42U
-#define RUN_DURATION_MS 4000U           /* 每次按 RUN 后采集 4 秒 */
-#define RUN_SAMPLE_PERIOD_MS 20U        /* 每 20ms 保存一个样本 */
-#define RUN_MAX_SAMPLES 200U            /* 4 秒最多保存 200 组样本 */
 #define CALIBRATION_MAGIC 0x43414C32UL   /* Flash 校准数据标志：CAL2 */
 #define CALIBRATION_VERSION 3UL
 #define CALIBRATION_VERSION_LEGACY 2UL
@@ -169,9 +137,6 @@ typedef struct
 #define LENGTH_OFFSET_X1000 253UL       /* 新标定曲线偏移量 0.253m */
 #define LENGTH_MAX_X10 500U             /* 最大测量长度 50.0m */
 #define LENGTH_INVALID_X10 0xFFFFU      /* 没有频率输入时的无效长度 */
-#define CABLE_SAMPLE_COUNT 5U            /* 每个状态连续读取 5 次，使用多数结果抗抖动 */
-#define CABLE_SETTLE_MS 300U              /* 输出后等待网线和输入电平稳定 */
-#define CABLE_SAMPLE_INTERVAL_MS 240U     /* 每路维持约1.5秒，便于万用表现场排查 */
 
 /* USER CODE END PD */
 
@@ -205,12 +170,7 @@ static uint8_t page_dirty = 1U;                          /* 切页后需要重�
 static uint8_t touch_was_pressed = 0U;                   /* 用于检测一次新的按下动作 */
 static uint8_t measurement_running = 0U;
 static UiPage measurement_page = UI_PAGE_HOME;
-static uint32_t measurement_start_tick = 0U;
-static uint32_t measurement_last_sample_tick = 0U;
-static uint32_t frequency_samples[RUN_MAX_SAMPLES];
-static int32_t difference_samples[RUN_MAX_SAMPLES];
-static uint16_t frequency_sample_count = 0U;
-static uint16_t difference_sample_count = 0U;
+static RunMeasurement run_measurement;
 static UiMeasurementResult measurement_results[4];
 static DoubleCalibrationData double_calibrations[2];     /* 0=UTP，1=SFTP */
 static SingleCalibrationData single_calibration;
@@ -228,6 +188,8 @@ static uint8_t calibration_selected_point = 0U;
 static CalibrationAutoAction calibration_auto_action = CAL_AUTO_NONE;
 static uint8_t calibration_auto_zero_ready[2] = {0U, 0U};
 static volatile uint8_t cable_scan_pending = 0U;
+static CableTestManager cable_test_manager;
+static CableTestResult cable_test_result;
 static volatile uint8_t storage_save_pending = 0U;
 static volatile uint8_t storage_save_busy = 0U;
 static uint8_t storage_save_success_status = 2U;
@@ -264,11 +226,6 @@ static uint16_t CalculateLengthX10(uint32_t frequency);
 static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10);
 static void Measurement_Start(uint32_t now);
 static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2);
-static uint32_t MedianU32(uint32_t *values, uint16_t count);
-static int32_t MedianS32(int32_t *values, uint16_t count);
-static float DifferenceToResistance(int32_t difference);
-static uint8_t Calibration_Fit(DoubleCalibrationData *calibration);
-static uint8_t SingleCalibration_Fit(void);
 static DoubleCalibrationData *Calibration_GetActiveDouble(void);
 static const DoubleCalibrationData *Calibration_GetDoubleByShield(uint8_t shielded);
 static float Calibration_ParseText(const char *text, uint8_t text_length);
@@ -283,11 +240,8 @@ static void Calibration_RequestSave(uint8_t success_status);
 static void Calibration_Load(void);
 static uint32_t Calibration_Checksum(const CalibrationStorage *data);
 static uint32_t Calibration_ChecksumV2(const CalibrationStorageV2 *data);
-static uint8_t Calibration_GetLength(float resistance_ohm, uint8_t shielded, float *length_m);
-static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m);
 static void Calibration_AutoStart(CalibrationAutoAction action);
 static void Calibration_AutoComplete(int32_t difference);
-static void CableTest_Run(UiMeasurementResult *result);
 void App_Init(void);
 void App_SamplingTaskStep(void);
 void App_MeasurementTaskStep(void);
@@ -460,7 +414,12 @@ void App_MeasurementTaskStep(void)
   if (cable_scan_pending != 0U)
   {
     cable_scan_pending = 0U;
-    CableTest_Run(&measurement_results[UI_PAGE_DOUBLE]);
+    CableTestManager_Start(&cable_test_manager, now);
+  }
+
+  if (cable_test_manager.running != 0U)
+  {
+    (void)CableTestManager_Process(&cable_test_manager, now, &cable_test_result);
   }
 
   /* RUN 测量按固定周期收集滤波后的数据，满 4 秒后计算中位数。 */
@@ -638,30 +597,25 @@ static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa1_freq
 static void Measurement_Start(uint32_t now)
 {
   measurement_page = current_page;
-  measurement_start_tick = now;
-  measurement_last_sample_tick = now - RUN_SAMPLE_PERIOD_MS;
-  frequency_sample_count = 0U;
-  difference_sample_count = 0U;
+  RunMeasurement_Start(&run_measurement, (uint8_t)measurement_page, now);
   measurement_results[measurement_page].valid = 0U;
   measurement_results[measurement_page].frequency_valid = 0U;
-  measurement_results[measurement_page].cable_valid = 0U;
-  measurement_results[measurement_page].cable_shielded = 0U;
-  measurement_results[measurement_page].cable_output_mask = 0U;
-  measurement_results[measurement_page].cable_out1_mask = 0U;
-  measurement_results[measurement_page].cable_out2_mask = 0U;
-  measurement_results[measurement_page].cable_wiring = CABLE_WIRING_UNKNOWN;
+  measurement_results[measurement_page].double_end = (DoubleEndMeasurementResult){0};
   measurement_running = 1U;
   page_dirty = 1U;
 
   /* 线序扫描交给独立测量任务，避免阻塞触摸、LCD、ADC和VOFA任务。 */
   if (measurement_page == UI_PAGE_DOUBLE)
   {
+    cable_test_manager = (CableTestManager){0};
+    cable_test_result = (CableTestResult){0};
     cable_scan_pending = 1U;
   }
 }
 
 static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2)
 {
+  RunMeasurementResult run_result = {0};
   UiMeasurementResult *result;
 
   if (measurement_running == 0U)
@@ -669,38 +623,31 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
     return;
   }
 
-  if ((now - measurement_last_sample_tick) >= RUN_SAMPLE_PERIOD_MS)
-  {
-    measurement_last_sample_tick = now;
-
-    if (difference_sample_count < RUN_MAX_SAMPLES)
-    {
-      difference_samples[difference_sample_count++] = (int32_t)value1 - (int32_t)value2;
-    }
-
-    if ((pa1_freq != 0U) && (frequency_sample_count < RUN_MAX_SAMPLES))
-    {
-      frequency_samples[frequency_sample_count++] = pa1_freq;
-    }
-  }
-
-  if ((now - measurement_start_tick) < RUN_DURATION_MS)
+  if (RunMeasurement_Update(&run_measurement, now, pa1_freq, value1, value2, &run_result) == 0U)
   {
     return;
   }
 
   result = &measurement_results[measurement_page];
-  result->frequency_valid = (frequency_sample_count != 0U) ? 1U : 0U;
-  result->frequency_hz = (frequency_sample_count != 0U) ? MedianU32(frequency_samples, frequency_sample_count) : 0U;
-  result->difference = (difference_sample_count != 0U) ? MedianS32(difference_samples, difference_sample_count) : 0;
+  result->frequency_valid = run_result.frequency_valid;
+  result->frequency_hz = run_result.frequency_hz;
+  result->difference = run_result.difference;
 
   if (measurement_page == UI_PAGE_SINGLE)
   {
     result->valid = result->frequency_valid;
   }
+  else if (measurement_page == UI_PAGE_DOUBLE)
+  {
+    result->valid = run_result.valid;
+    DoubleEndMeasurement_Calculate(result->difference,
+                                   &cable_test_result,
+                                   Calibration_GetDoubleByShield(cable_test_result.shielded),
+                                   &result->double_end);
+  }
   else
   {
-    result->valid = (difference_sample_count != 0U) ? 1U : 0U;
+    result->valid = run_result.valid;
   }
 
   if ((measurement_page == UI_PAGE_CALIBRATION) &&
@@ -711,152 +658,6 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
 
   measurement_running = 0U;
   page_dirty = 1U;
-}
-
-static void CableTest_Run(UiMeasurementResult *result)
-{
-  uint8_t input_masks[CABLE_GPIO_OUTPUT_COUNT] = {0U};
-  uint8_t straight = 1U;
-  uint8_t shield_high_count = 0U;
-  uint8_t output_high_mask = 0U;
-
-  if (result == NULL)
-  {
-    return;
-  }
-
-  CableGpio_SetOutputsHighImpedance();
-
-  for (uint8_t output = 0U; output < CABLE_GPIO_OUTPUT_COUNT; ++output)
-  {
-    uint8_t high_counts[CABLE_GPIO_INPUT_COUNT] = {0U};
-
-    CableGpio_EnableOutput(output);
-    (void)osDelay(CABLE_SETTLE_MS);
-
-    /* 回读输出引脚实际电平，用于区分GPIO输出故障和网线/输入接线故障。 */
-    if (CableGpio_IsOutputHigh(output) != 0U)
-    {
-      output_high_mask |= (uint8_t)(1U << output);
-    }
-
-    for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
-    {
-      uint8_t input_mask = CableGpio_ReadInputMask();
-
-      for (uint8_t input = 0U; input < CABLE_GPIO_INPUT_COUNT; ++input)
-      {
-        if ((input_mask & (uint8_t)(1U << input)) != 0U)
-        {
-          high_counts[input]++;
-        }
-      }
-      (void)osDelay(CABLE_SAMPLE_INTERVAL_MS);
-    }
-
-    for (uint8_t input = 0U; input < CABLE_GPIO_INPUT_COUNT; ++input)
-    {
-      if (high_counts[input] > (CABLE_SAMPLE_COUNT / 2U))
-      {
-        input_masks[output] |= (uint8_t)(1U << input);
-      }
-    }
-
-    /* 当前发送脚读完后也恢复高阻，再测试下一芯。 */
-    CableGpio_SetOutputsHighImpedance();
-    (void)osDelay(1U);
-  }
-
-  /* 外壳接收脚有内部下拉：外部 3.3V 可稳定判为 SFTP，断开则判为 UTP。 */
-  for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
-  {
-    if (CableGpio_ReadShield() != 0U)
-    {
-      shield_high_count++;
-    }
-    (void)osDelay(1U);
-  }
-
-  CableGpio_RestoreOutputsLow();
-
-  /*
-   * 二分类模式只检查直连所需的关键位，忽略接收端可能出现的额外高电平：
-   * OUT1 扫描时 IN1 为高，并且 OUT2 扫描时 IN2 为高，即判定为直连。
-   */
-  if (((input_masks[0] & 0x01U) == 0U) || ((input_masks[1] & 0x02U) == 0U))
-  {
-    straight = 0U;
-  }
-
-  result->cable_valid = 1U;
-  result->cable_shielded = (shield_high_count > (CABLE_SAMPLE_COUNT / 2U)) ? 1U : 0U;
-  result->cable_output_mask = output_high_mask;
-  result->cable_out1_mask = input_masks[0];
-  result->cable_out2_mask = input_masks[1];
-
-  if (straight != 0U)
-  {
-    result->cable_wiring = CABLE_WIRING_STRAIGHT;
-  }
-  else
-  {
-    /* 用户要求采用二分类：只要不是完整直连线，一律显示为交叉线。 */
-    result->cable_wiring = CABLE_WIRING_CROSS;
-  }
-}
-
-static uint32_t MedianU32(uint32_t *values, uint16_t count)
-{
-  for (uint16_t i = 1U; i < count; ++i)
-  {
-    uint32_t key = values[i];
-    uint16_t j = i;
-
-    while ((j > 0U) && (values[j - 1U] > key))
-    {
-      values[j] = values[j - 1U];
-      --j;
-    }
-
-    values[j] = key;
-  }
-
-  if ((count & 1U) != 0U)
-  {
-    return values[count / 2U];
-  }
-
-  return (uint32_t)(((uint64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2U);
-}
-
-static int32_t MedianS32(int32_t *values, uint16_t count)
-{
-  for (uint16_t i = 1U; i < count; ++i)
-  {
-    int32_t key = values[i];
-    uint16_t j = i;
-
-    while ((j > 0U) && (values[j - 1U] > key))
-    {
-      values[j] = values[j - 1U];
-      --j;
-    }
-
-    values[j] = key;
-  }
-
-  if ((count & 1U) != 0U)
-  {
-    return values[count / 2U];
-  }
-
-  return (int32_t)(((int64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2);
-}
-
-static float DifferenceToResistance(int32_t difference)
-{
-  uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
-  return ((float)absolute_difference * DIFF_VOLTAGE_SCALE) / MEASURE_CURRENT_MA;
 }
 
 static DoubleCalibrationData *Calibration_GetActiveDouble(void)
@@ -876,80 +677,6 @@ static DoubleCalibrationData *Calibration_GetActiveDouble(void)
 static const DoubleCalibrationData *Calibration_GetDoubleByShield(uint8_t shielded)
 {
   return &double_calibrations[(shielded != 0U) ? 1U : 0U];
-}
-
-static uint8_t Calibration_Fit(DoubleCalibrationData *calibration)
-{
-  float sum_x = 0.0f;
-  float sum_y = 0.0f;
-  float sum_xx = 0.0f;
-  float sum_xy = 0.0f;
-  float denominator;
-  float count;
-
-  if ((calibration == NULL) || (calibration->point_count < 2U))
-  {
-    return 0U;
-  }
-
-  count = (float)calibration->point_count;
-
-  for (uint32_t i = 0U; i < calibration->point_count; ++i)
-  {
-    float x = calibration->length_m[i];
-    float y = calibration->resistance_ohm[i];
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  denominator = count * sum_xx - sum_x * sum_x;
-  if ((denominator > -0.0001f) && (denominator < 0.0001f))
-  {
-    return 0U;
-  }
-
-  calibration->resistance_per_meter = (count * sum_xy - sum_x * sum_y) / denominator;
-  calibration->zero_resistance = (sum_y - calibration->resistance_per_meter * sum_x) / count;
-
-  return (calibration->resistance_per_meter > 0.000001f) ? 1U : 0U;
-}
-
-static uint8_t SingleCalibration_Fit(void)
-{
-  float sum_x = 0.0f;
-  float sum_y = 0.0f;
-  float sum_xx = 0.0f;
-  float sum_xy = 0.0f;
-  float denominator;
-  float count = (float)single_calibration.point_count;
-
-  if (single_calibration.point_count < 2U)
-  {
-    return 0U;
-  }
-
-  for (uint32_t i = 0U; i < single_calibration.point_count; ++i)
-  {
-    float x = 1000000.0f / (float)single_calibration.frequency_hz[i];
-    float y = single_calibration.length_m[i];
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  denominator = count * sum_xx - sum_x * sum_x;
-  if ((denominator > -0.0001f) && (denominator < 0.0001f))
-  {
-    return 0U;
-  }
-
-  single_calibration.inverse_period_slope = (count * sum_xy - sum_x * sum_y) / denominator;
-  single_calibration.offset_m = (sum_y - single_calibration.inverse_period_slope * sum_x) / count;
-
-  return (single_calibration.inverse_period_slope > 0.000001f) ? 1U : 0U;
 }
 
 static void Calibration_AutoStart(CalibrationAutoAction action)
@@ -983,7 +710,9 @@ static void Calibration_AutoComplete(int32_t difference)
   }
 
   profile_index = (uint8_t)(calibration_mode - 1U);
-  measured_resistance = DifferenceToResistance(difference);
+  measured_resistance = MeasurementMath_DifferenceToResistance(difference,
+                                                               DIFF_VOLTAGE_SCALE,
+                                                               MEASURE_CURRENT_MA);
 
   if (calibration_auto_action == CAL_AUTO_ZERO)
   {
@@ -1144,7 +873,7 @@ static uint8_t Calibration_AddPoint(void)
     calibration_selected_point = (uint8_t)(single_calibration.point_count - 1U);
     if (single_calibration.point_count >= 2U)
     {
-      (void)SingleCalibration_Fit();
+      (void)CalibrationModel_FitSingle(&single_calibration);
     }
   }
   else
@@ -1162,7 +891,7 @@ static uint8_t Calibration_AddPoint(void)
     calibration_selected_point = (uint8_t)(double_calibration->point_count - 1U);
     if (double_calibration->point_count >= 2U)
     {
-      (void)Calibration_Fit(double_calibration);
+      (void)CalibrationModel_FitDouble(double_calibration);
     }
   }
 
@@ -1192,7 +921,7 @@ static void Calibration_DeletePoint(void)
     single_calibration.point_count--;
     if (single_calibration.point_count >= 2U)
     {
-      (void)SingleCalibration_Fit();
+      (void)CalibrationModel_FitSingle(&single_calibration);
     }
   }
   else
@@ -1210,7 +939,7 @@ static void Calibration_DeletePoint(void)
     double_calibration->point_count--;
     if (double_calibration->point_count >= 2U)
     {
-      (void)Calibration_Fit(double_calibration);
+      (void)CalibrationModel_FitDouble(double_calibration);
     }
     else
     {
@@ -1373,53 +1102,6 @@ static void Calibration_Load(void)
     double_calibrations[0] = legacy.double_end;
     double_calibrations[1] = legacy.double_end;
   }
-}
-
-static uint8_t Calibration_GetLength(float resistance_ohm, uint8_t shielded, float *length_m)
-{
-  const DoubleCalibrationData *calibration = Calibration_GetDoubleByShield(shielded);
-
-  if ((length_m == NULL) || (calibration == NULL) ||
-      (calibration->resistance_per_meter <= 0.000001f))
-  {
-    return 0U;
-  }
-
-  *length_m = (resistance_ohm - calibration->zero_resistance) /
-              calibration->resistance_per_meter;
-
-  if (*length_m < 0.0f)
-  {
-    *length_m = 0.0f;
-  }
-  else if (*length_m > 1000.0f)
-  {
-    *length_m = 1000.0f;
-  }
-
-  return 1U;
-}
-
-static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m)
-{
-  if ((length_m == NULL) || (frequency_hz == 0U) || (single_calibration.point_count < 2U) ||
-      (single_calibration.inverse_period_slope <= 0.000001f))
-  {
-    return 0U;
-  }
-
-  *length_m = single_calibration.inverse_period_slope * (1000000.0f / (float)frequency_hz) +
-              single_calibration.offset_m;
-  if (*length_m < 0.0f)
-  {
-    *length_m = 0.0f;
-  }
-  else if (*length_m > 1000.0f)
-  {
-    *length_m = 1000.0f;
-  }
-
-  return 1U;
 }
 
 static void Ui_Init(void)
@@ -2185,34 +1867,25 @@ static void Ui_DrawSingleValue(uint32_t pa1_freq)
 static uint16_t CalculateLengthX10(uint32_t frequency)
 {
   float calibrated_length_m;
-  uint32_t reciprocal_x1000;
-  uint32_t length_x1000;
 
   if (frequency == 0U)
   {
-    return LENGTH_INVALID_X10;
+    return 0U;
   }
 
-  if (SingleCalibration_GetLength(frequency, &calibrated_length_m) != 0U)
+  if (CalibrationModel_GetSingleLength(&single_calibration,
+                                       frequency,
+                                       &calibrated_length_m) != 0U)
   {
     uint32_t calibrated_x10 = (uint32_t)(calibrated_length_m * 10.0f + 0.5f);
     return (calibrated_x10 > LENGTH_MAX_X10) ? LENGTH_MAX_X10 : (uint16_t)calibrated_x10;
   }
 
-  reciprocal_x1000 = LENGTH_SCALE_X1000 / frequency;
-  if (reciprocal_x1000 <= LENGTH_OFFSET_X1000)
-  {
-    return 0U;
-  }
-
-  length_x1000 = reciprocal_x1000 - LENGTH_OFFSET_X1000;
-  if (length_x1000 >= ((uint32_t)LENGTH_MAX_X10 * 100U))
-  {
-    return LENGTH_MAX_X10;
-  }
-
-  /* 从 0.001m 四舍五入到屏幕显示使用的 0.1m。 */
-  return (uint16_t)((length_x1000 + 50U) / 100U);
+  return MeasurementMath_ReciprocalLengthX10(frequency,
+                                             LENGTH_SCALE_X1000,
+                                             LENGTH_OFFSET_X1000,
+                                             LENGTH_MAX_X10,
+                                             LENGTH_INVALID_X10);
 }
 
 static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
@@ -2231,32 +1904,25 @@ static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
 
 static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
 {
-  int32_t difference;
-  uint32_t absolute_difference;
-  float voltage_mv;
-  float resistance_ohm;
-  float line_length_m = 0.0f;
+  const DoubleEndMeasurementResult *double_result;
   uint32_t voltage_display;
   uint32_t resistance_x100;
   uint32_t length_x10;
 
-  if ((result == NULL) || (result->valid == 0U))
+  if ((result == NULL) || (result->valid == 0U) || (result->double_end.valid == 0U))
   {
     return;
   }
 
-  difference = result->difference;
-  absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
-  voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
-  resistance_ohm = DifferenceToResistance(difference);
-  voltage_display = (uint32_t)(voltage_mv + 0.5f);
-  resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
+  double_result = &result->double_end;
+  voltage_display = (uint32_t)(double_result->voltage_mv + 0.5f);
+  resistance_x100 = (uint32_t)(double_result->resistance_ohm * 100.0f + 0.5f);
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
   /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
-  Ui_DrawSignedValue(118, 46, difference, 16U);
+  Ui_DrawSignedValue(118, 46, double_result->difference, 16U);
 
   /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
   LCD_ShowNum(118, 70, voltage_display, 4, 16);
@@ -2267,9 +1933,9 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
   LCD_ShowxNum(142, 94, resistance_x100 % 100U, 2, 16, 0x80U);
   LCD_ShowString(162, 94, 24, 16, 16, (uint8_t *)"ohm");
 
-  if (Calibration_GetLength(resistance_ohm, result->cable_shielded, &line_length_m) != 0U)
+  if (double_result->length_valid != 0U)
   {
-    length_x10 = (uint32_t)(line_length_m * 10.0f + 0.5f);
+    length_x10 = (uint32_t)(double_result->length_m * 10.0f + 0.5f);
     LCD_ShowNum(118, 118, length_x10 / 10U, 4, 16);
     LCD_ShowString(150, 118, 8, 16, 16, (uint8_t *)".");
     LCD_ShowNum(158, 118, length_x10 % 10U, 1, 16);
@@ -2280,21 +1946,21 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
     LCD_ShowString(118, 118, 48, 16, 16, (uint8_t *)"--.-m");
   }
 
-  if (result->cable_valid != 0U)
+  if (double_result->cable.valid != 0U)
   {
     LCD_ShowString(118, 146, 32, 16, 16,
-                   (uint8_t *)(result->cable_shielded != 0U ? "SFTP" : "UTP"));
+                   (uint8_t *)(double_result->cable.shielded != 0U ? "SFTP" : "UTP"));
 
-    if (result->cable_wiring == CABLE_WIRING_STRAIGHT)
+    if (double_result->cable.wiring == CABLE_WIRING_STRAIGHT)
     {
       LCD_ShowString(118, 170, 64, 16, 16, (uint8_t *)"STRAIGHT");
     }
-    else if (result->cable_wiring == CABLE_WIRING_CROSS)
+    else if (double_result->cable.wiring == CABLE_WIRING_CROSS)
     {
       LCD_ShowString(118, 170, 40, 16, 16, (uint8_t *)"CROSS");
-      LCD_ShowxNum(162, 170, result->cable_out1_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(162, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
       LCD_ShowString(178, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(190, 170, result->cable_out2_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(190, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
     else
     {
@@ -2303,11 +1969,11 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
        * IN1=1、IN2=2、IN3=4、IN6=8；直连应为 01/02，交叉应为 04/08。
        */
       LCD_ShowString(118, 170, 8, 16, 16, (uint8_t *)"O");
-      LCD_ShowNum(126, 170, result->cable_output_mask, 1, 16);
+      LCD_ShowNum(126, 170, double_result->cable.output_mask, 1, 16);
       LCD_ShowString(138, 170, 8, 16, 16, (uint8_t *)":");
-      LCD_ShowxNum(150, 170, result->cable_out1_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(150, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
       LCD_ShowString(166, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(178, 170, result->cable_out2_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(178, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
   }
 }

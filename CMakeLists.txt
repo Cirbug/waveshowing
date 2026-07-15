@@ -45,6 +45,13 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Algorithm/scalar_kalman.c
+    App/Algorithm/median_filter.c
+    App/Algorithm/linear_fit.c
+    App/Algorithm/measurement_math.c
+    App/Business/run_measurement.c
+    App/Business/cable_test_manager.c
+    App/Business/calibration_model.c
+    App/Business/double_end_measurement.c
     HARDWARE/LCD/lcd.c
     HARDWARE/TOUCH/touch.c
     HARDWARE/SPI_FLASH/spi_flash.c
@@ -54,6 +61,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     App/Algorithm
+    App/Business
     HARDWARE/LCD
     HARDWARE/TOUCH
     HARDWARE/SPI_FLASH
