@@ -432,17 +432,19 @@ void App_Init(void)
   scalar_kalman_init(&adc1_kalman, 1.0f, 1.0f, ADC_KALMAN_Q, ADC_KALMAN_R);
   scalar_kalman_init(&adc2_kalman, 1.0f, 1.0f, ADC_KALMAN_Q, ADC_KALMAN_R);
   scalar_kalman_init(&pa1_freq_kalman, 1.0f, 1.0f, PA1_KALMAN_Q, PA1_KALMAN_R);
+
+  /* LCD和触摸优先初始化，后续外设异常时屏幕也能先正常点亮。 */
+  Ui_Init();
+  Touch_Init();
   Calibration_Load();
 
-  /* AD9954使用20MHz参考时钟和20倍频，ASF=6553对应模块约200mV峰峰值。 */
+  /* 频率直接填写Hz，幅度直接填写十进制mVpp。 */
   if ((Ad9954_Init() == 0U) ||
-      Ad9954_SetOutput(30000000UL, AD9954_MAX_AMPLITUDE_SCALE))
+      (Ad9954_SetOutput(30000000UL, AD9954_MAX_AMPLITUDE_SCALE) == 0U))
   {
     Error_Handler();
   }
 
-  Ui_Init();
-  Touch_Init();
   AdcDacVofa_Start();
 
   if (HAL_TIM_IC_Start_IT(&htim5, TIM_CHANNEL_2) != HAL_OK)
@@ -468,8 +470,11 @@ void App_SamplingTaskStep(void)
   adc1_value = FilterAdcValue(&adc1_kalman, &adc1_kalman_ready, adc1_sample);
   adc2_value = FilterAdcValue(&adc2_kalman, &adc2_kalman_ready, adc2_sample);
 
-  /* ADC3按规则组顺序读取：CH10为IN，CH11为OUT；RUN阶段再统一取中位数。 */
-  (void)ReadAdc3Pair(&adc3_input_value, &adc3_output_value);
+  /* ADC3只在双端RUN期间读取，避免空闲时占用最高优先级采样任务。 */
+  if ((measurement_running != 0U) && (measurement_page == UI_PAGE_DOUBLE))
+  {
+    (void)ReadAdc3Pair(&adc3_input_value, &adc3_output_value);
+  }
 
   /* 用 ADC 采样值做软件测频。这个方法适合低频，采样间隔越稳定越准 */
   adc1_frequency_hz = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
@@ -717,6 +722,8 @@ static void Measurement_Start(uint32_t now)
   /* 线序扫描交给独立测量任务，避免阻塞触摸、LCD、ADC和VOFA任务。 */
   if (measurement_page == UI_PAGE_DOUBLE)
   {
+    adc3_input_value = 0U;
+    adc3_output_value = 0U;
     cable_test_manager = (CableTestManager){0};
     cable_test_result = (CableTestResult){0};
     cable_scan_pending = 1U;
